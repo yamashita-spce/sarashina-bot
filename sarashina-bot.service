@@ -1,0 +1,15 @@
+[Unit]
+Description=Sarashina Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/shita/private/salashina
+ExecStart=/home/shita/private/salashina/.venv/bin/python bot/main.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
