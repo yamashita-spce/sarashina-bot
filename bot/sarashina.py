@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from collections import deque
 from collections.abc import AsyncIterator
@@ -207,6 +208,21 @@ class SarashinaClient:
         async with resp:
             body = await resp.json()
         return [(c["message"].get("content") or "").strip() for c in body["choices"]]
+
+    async def answer_scores(self, question: str, answers: list[str]) -> list[float]:
+        """各回答が「質問への答えになっているか」の度合い (rerank の GENERAL_QA スコアを logit にしたもの).
+
+        rerank のスコアは同じ話題なら 0.9999… に張り付くため、logit (log(p/(1-p))) に直して比べる。
+        実測: 質問に答えている 13〜21 / 一部だけ答えている 10〜14 / 同じ話題だが答えていない 2〜5。
+        """
+        if not answers:
+            return []
+        ranked = await self.rerank(question, answers, task_type="GENERAL_QA")
+        scores = [0.0] * len(answers)
+        for i, p in ranked:
+            p = min(max(p, 1e-9), 1 - 1e-9)
+            scores[i] = math.log(p / (1 - p))
+        return scores
 
     async def chat_stream(
         self,

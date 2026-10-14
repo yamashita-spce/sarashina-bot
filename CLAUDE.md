@@ -22,7 +22,8 @@ Discord の指定チャンネルの投稿に、国産LLM Sarashina (SB Intuition
 - **検索は何往復もして、十分な情報が集まってから出す**（ユーザー要望: 「答えられません」で終わらせない）: `Searcher._deep_search` が nano (`NEXT_QUERY_PROMPT`) で十分か判定→次の検索語、新規が出なくなったら条件を広げる（期間→チャンネル→人）、まとめは mini 枠を先に `reserve()` して `deadline` まで検索を続ける。一致が無ければ `Hit.approx` を立て、呼び出し側で聞き直しにする
 - **出力の形をそろえる**（ユーザー要望）: 検索・RAG は「文章で答え＋末尾に参考にした発言」（`Searcher.compose` / `cite()`。本文は短い [n]、リンクは末尾）、何気ない会話は普通の会話文、根拠が足りない時だけ `Searcher.clarify` で聞き直す。根拠なし判定は「元の話題語がどの本文にも無い」(`_deep_search`) か「compose の1文目が見当たらない旨」(`NOT_FOUND`)
 - **聞き直しは最終手段**（ユーザー要望: 簡単に聞き直さない・極力一発で答える）: `handle_search` は 通常検索→`compose_answer` → 答えられなければ `search(exhaustive=True)`（5往復固定・十分判定で止めない・条件を広げ切る・根拠語が無くても関連会話で答える）→`compose_answer` → それでもダメなら `clarify`。「十分」は nano 判定＋根拠語が本文にあること
-- **回答の精査**（ユーザー要望: 見つかったらすぐ答える癖をやめ、より良い答えか精査）: `Searcher.compose` が mini `chat_many(n=3)` で回答案を複数生成 → nano (`JUDGE_PROMPT`) が根拠・網羅性で審査して選択、`ComposeResult.missing/search` を返す → `handle_search` が欠けている観点を追加検索し、新規会話があれば `compose_answer(refine=True)` で書き直す（1回）。rerank は回答案の比較では全案 1.0 付近で使えなかった
+- **回答の精査**（ユーザー要望: 見つかったらすぐ答える癖をやめ、より良い答えか精査）: `Searcher.compose` が mini `chat_many(n=3)` で回答案を複数生成 → nano (`JUDGE_PROMPT`) が根拠・網羅性で審査して選択、`ComposeResult.missing/search` を返す → `handle_search` が欠けている観点を追加検索し、新規会話があれば `compose_answer(refine=True)` で書き直す（1回）。採用は「根拠と食い違う案を除き、回答度最大」（審査員の推しが僅差なら優先）
+- **回答度** = `SarashinaClient.answer_scores`: rerank `GENERAL_QA` のスコアを logit にしたもの。生スコアは 0.9999 に張り付くので logit 必須。「質問への答えになっているか」は測れる（答えている 13〜21 / 一部 10〜14 / 答えていない 2〜5）が、事実の正誤は測れない。ユーザー方針「正確さより質問への回答になっているかを見る」。普通の質問でも `check_and_revise` で回答度 < `ANSWER_MIN_SCORE`(7) なら書き直し
 - **検索中の表示は一言コメントを10秒に1回まで**（ユーザー要望:「1回目:」のような表示はダサい）: `ThinkingView.comment()` が `COMMENT_SECONDS` で間引く。待機中の思考ラベルも10秒ごと
 - Bot と会話するチャンネルは索引しない（`Indexer.exclude_ids`、起動時に `purge_channel`）。依頼文が検索結果・次の検索語を汚染したため
 

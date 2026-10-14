@@ -107,21 +107,20 @@ LOCATE_RULE = "依頼は「その話をどこでしていたか」を知りた�
 SUMMARIZE_RULE = "依頼は過去の会話の内容を知りたいもの。話題ごとに要点を整理して答える"
 
 JUDGE_PROMPT = """あなたは回答の審査員です。ユーザーの依頼、根拠となる過去の会話 (各発言に [番号])、
-AI が書いた回答案 (A, B, C ...) が与えられます。手順に沿って審査し、JSON だけを返してください。
+AI が書いた回答案 (A, B, C ...) が与えられます。各回答案には「回答度」(質問への答えになっている度合い。
+高いほど良い) が付いています。手順に沿って審査し、JSON だけを返してください。
 
 手順:
-1. 依頼が本当に求めていること (知りたいこと) を一文で書く
-2. 各回答案を次の観点で評価する
-   - 依頼に正面から答えているか (1文目で答えているか)
-   - 書かれた内容が、引用した [番号] の発言に実際に書かれているか (根拠のない記述・番号の付け間違いが無いか)
-   - 根拠となる会話にある大事な情報を落としていないか
-3. 最も良い回答案を選ぶ
-4. どの回答案も、依頼に答えるのに大事な観点が欠けている (会話には無いが、探せば見つかりそうな) 場合は、
+1. 依頼が本当に求めていること (いつ・どこで・どうなったか・何が決まったか 等) を一文で書く
+2. 各回答案が、その求めていることに直接答えているかを確認する (最も重視する)
+3. 各回答案について、根拠となる会話と食い違う記述 (会話に無い出来事を断定している等) があれば、その案の記号を挙げる
+4. 求めていることに最も直接答えている回答案を選ぶ (回答度も参考にする)
+5. どの回答案も、依頼に答えるのに大事な観点が欠けている (会話には無いが、探せば見つかりそうな) 場合は、
    その観点と、それを探すための短い検索語を書く。十分なら空文字
 
 出力形式:
 {"need": "依頼が求めていること", "best": "A などの記号", "reasons": "選んだ理由 (短く)",
- "problems": "選んだ案に残る問題 (無ければ空文字)", "missing": "欠けている観点 (無ければ空文字)",
+ "contradicts": ["根拠と食い違う回答案の記号", ...], "missing": "欠けている観点 (無ければ空文字)",
  "search": "欠けている観点を探す検索語 (無ければ空文字)"}"""
 
 CLARIFY_PROMPT = """あなたは Discord サーバーの過去ログを調べるアシスタントです。
@@ -791,10 +790,17 @@ class Searcher:
         if len(usable) == 1:
             return ComposeResult(cite(usable[0], numbered, "参考にした発言"))
 
-        await report(f"{len(usable)}通りの回答案を書いて、どれが質問に一番合うか比べています")
-        # ※ rerank で回答案と質問の関連度も測ったが、どの案も 1.0 付近に張り付き差が出なかったため使わない
+        await report(f"{len(usable)}通りの回答案を書いて、どれが質問に一番答えているか比べています")
         labels = "ABCDE"
-        listing = "\n\n".join(f"## 回答案 {labels[i]}\n{d}" for i, d in enumerate(usable))
+        # 「質問への答えになっているか」を rerank (GENERAL_QA, logit) で測る
+        try:
+            scores = await self.sarashina.answer_scores(user_text, [re.sub(r"\[\d{1,3}\]", "", d) for d in usable])
+        except Exception:
+            log.warning("回答度の計測に失敗しました", exc_info=True)
+            scores = [0.0] * len(usable)
+        listing = "\n\n".join(
+            f"## 回答案 {labels[i]} (回答度 {scores[i]:.1f})\n{d}" for i, d in enumerate(usable)
+        )
         judged: dict = {}
         try:
             raw = await self.sarashina.chat(
@@ -808,10 +814,18 @@ class Searcher:
             judged = json.loads(raw)
         except Exception:
             log.warning("回答案の審査に失敗しました", exc_info=True)
+        # 選び方: 根拠と食い違う案を除き、「質問への答えになっているか」(回答度) が最も高い案。
+        # 審査員の推す案が回答度で僅差 (1.0 以内) なら審査員の判断を優先する
+        contradicts = {str(c).strip()[:1].upper() for c in judged.get("contradicts") or []}
+        ok = [i for i in range(len(usable)) if labels[i] not in contradicts] or list(range(len(usable)))
+        idx = max(ok, key=lambda i: scores[i])
         best = str(judged.get("best") or "").strip()[:1].upper()
-        idx = labels.index(best) if best and best in labels[:len(usable)] else 0
-        log.info("回答案 %d 通りから %s を選択 / 理由: %s / 欠け: %s",
-                 len(usable), labels[idx], judged.get("reasons"), judged.get("missing"))
+        if best in labels[:len(usable)] and labels.index(best) in ok \
+                and scores[labels.index(best)] >= scores[idx] - 1.0:
+            idx = labels.index(best)
+        log.info("回答案 %d 通りから %s を選択 / 回答度 %s / 食い違い %s / 審査員の推し %s / 欠け: %s",
+                 len(usable), labels[idx], {labels[i]: round(v, 1) for i, v in enumerate(scores)},
+                 sorted(contradicts), best, judged.get("missing"))
         return ComposeResult(
             cite(usable[idx], numbered, "参考にした発言"),
             missing=str(judged.get("missing") or "").strip(),

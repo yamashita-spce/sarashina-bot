@@ -107,6 +107,9 @@ ANSWER_CHECK_PROMPT = """あなたは回答のチェック係です。ユーザ�
    - 根拠のない最新情報 (天気・ニュース等) を断定している
 細かい言い回し・文体・好みの問題は指摘しない。
 JSON だけを返す: {"own_answer": "自分で考えた答えの要点 (途中式を含む)", "verdict": "ok" または "revise", "problems": ["具体的な問題と直し方", ...]}"""
+# 「質問への答えになっているか」(rerank GENERAL_QA の logit) がこれ未満なら書き直す
+# 実測: 答えている 13〜21 / 一部 10〜14 / 同じ話題だが答えていない 2〜5
+ANSWER_MIN_SCORE = float(os.getenv("ANSWER_MIN_SCORE", "7"))
 REVISE_INSTRUCTION = """(チェック係から次の指摘がありました。指摘が正しい点だけを直して、回答全体を書き直してください。
 指摘が誤っている場合は元の回答をそのまま出力してください。前置きや「修正しました」等の説明は書かず、回答本文だけを出力すること)
 {problems}"""
@@ -482,7 +485,7 @@ async def on_message(message: discord.Message) -> None:
     try:
         answer = await sarashina.chat(messages, slot=slot)
         if ANSWER_CHECK_ENABLED:
-            answer = await check_and_revise(view, messages, answer)
+            answer = await check_and_revise(view, messages, answer, question)
     except SarashinaError as e:
         log.error("Sarashina API エラー: %s", e)
         answer = f"⚠️ Sarashina API でエラーが発生しました: `{truncate(str(e), 300)}`"
@@ -531,9 +534,24 @@ async def wait_for_mini(view: ThinkingView, extra: list[str] | None = None, slot
     return slot
 
 
-async def check_and_revise(view: ThinkingView, messages: list[dict], draft: str) -> str:
-    """回答案を nano でチェックし、重大な問題があれば mini で1回だけ書き直す."""
+async def check_and_revise(
+    view: ThinkingView, messages: list[dict], draft: str, question: str = ""
+) -> str:
+    """回答案をチェックし、問題があれば mini で1回だけ書き直す.
+
+    1. rerank (GENERAL_QA) で「質問への答えになっているか」を測り、低ければ書き直す (速い)
+    2. nano が「まず自分で解いて比べる」手順で、事実・計算・取り違えの誤りを調べる
+    """
     view.set_phase("check")
+    problems: list[str] = []
+    if question:
+        try:
+            score = (await sarashina.answer_scores(question, [draft]))[0]
+            log.info("回答度 %.1f", score)
+            if score < ANSWER_MIN_SCORE:
+                problems.append("質問に直接答えていない。質問が求めていること (いつ・どこで・何が・どうなったか等) に、1文目で直接答えること")
+        except Exception:
+            log.warning("回答度の計測に失敗しました", exc_info=True)
     context = "\n".join(f"{m['role']}: {m['content'][:400]}" for m in messages[1:][-5:])
     try:
         raw = await sarashina.chat(
@@ -545,11 +563,11 @@ async def check_and_revise(view: ThinkingView, messages: list[dict], draft: str)
             response_format={"type": "json_object"},
         )
         result = json.loads(raw)
+        if result.get("verdict") == "revise":
+            problems += [p for p in result.get("problems") or [] if isinstance(p, str) and p.strip()]
     except Exception:
-        log.warning("回答のチェックに失敗しました (回答案をそのまま使います)", exc_info=True)
-        return draft
-    problems = [p for p in result.get("problems") or [] if isinstance(p, str) and p.strip()]
-    if result.get("verdict") != "revise" or not problems:
+        log.warning("回答のチェックに失敗しました", exc_info=True)
+    if not problems:
         return draft
     log.info("回答を書き直します: %s", problems)
     view.note("見直しで直したい点が見つかったので書き直しています")
