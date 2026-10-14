@@ -19,7 +19,9 @@ Discord の指定チャンネルの投稿に、国産LLM Sarashina (SB Intuition
 - **速さより回答の質を優先**（レート制限を考慮しつつ遅くなってもよい）→ 思考 on、`check_and_revise`（nano が「まず自分で解いて比較」→重大な問題だけ mini が1回書き直す）
 - **thinking の UX はパーソナライズ**: `make_plan`（nano, `PLAN_LABELS_PROMPT`）で質問ごとに4段階（gather/think/verify/write）の具体的ラベルを作り、`ThinkingView` が質問者名・topic・段階の進み具合・見つかった会話のメモ（`note()`）と一緒に表示。フェーズ→段階の対応は `PHASE_STAGE`
 - mini の枠待ちは `wait_for_mini()` に集約（予約→待機）。待つ間は `view.thinking_labels()` の質問に合わせた思考ラベルを `cycle` で切り替えて表示（ユーザー要望: 待たせている間も thinking を見せる）
-- **検索は何往復もして、十分な情報が集まってから出す**（ユーザー要望: 「答えられません」で終わらせない）: `Searcher._deep_search` が nano (`NEXT_QUERY_PROMPT`) で十分か判定→次の検索語、新規が出なくなったら条件を広げる（期間→チャンネル→人）、まとめは mini 枠を先に `reserve()` して `deadline` まで検索を続ける。一致が無ければ `Hit.approx` で「近い話題」として返す
+- **検索は何往復もして、十分な情報が集まってから出す**（ユーザー要望: 「答えられません」で終わらせない）: `Searcher._deep_search` が nano (`NEXT_QUERY_PROMPT`) で十分か判定→次の検索語、新規が出なくなったら条件を広げる（期間→チャンネル→人）、まとめは mini 枠を先に `reserve()` して `deadline` まで検索を続ける。一致が無ければ `Hit.approx` を立て、呼び出し側で聞き直しにする
+- **出力の形をそろえる**（ユーザー要望）: 検索・RAG は「文章で答え＋末尾に参考にした発言」（`Searcher.compose` / `cite()`。本文は短い [n]、リンクは末尾）、何気ない会話は普通の会話文、根拠が足りない時だけ `Searcher.clarify` で聞き直す。根拠なし判定は「元の話題語がどの本文にも無い」(`_deep_search`) か「compose の1文目が見当たらない旨」(`NOT_FOUND`)
+- **検索中の表示は一言コメントを10秒に1回まで**（ユーザー要望:「1回目:」のような表示はダサい）: `ThinkingView.comment()` が `COMMENT_SECONDS` で間引く。待機中の思考ラベルも10秒ごと
 - Bot と会話するチャンネルは索引しない（`Indexer.exclude_ids`、起動時に `purge_channel`）。依頼文が検索結果・次の検索語を汚染したため
 
 ## ユーザー要望・決定事項（以前）

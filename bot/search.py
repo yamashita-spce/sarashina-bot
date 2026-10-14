@@ -88,17 +88,29 @@ KNOWLEDGE_PROMPT = """あなたは判定係です。ユーザーの質問と、�
 挨拶・雑談・一般常識で答えられる質問なら、空配列を返すこと。
 出力形式: {"results": [{"candidate": 候補番号, "message": 発言番号}, ...]}"""
 
-SUMMARIZE_PROMPT = """あなたは Discord サーバーの過去ログを調べるアシスタントです。
+ANSWER_PROMPT = """あなたは Discord サーバーの過去ログを調べて答えるアシスタントです。
 以下は検索で見つかった過去の会話です。各発言の先頭に [番号] が付いています。
-これらの発言だけを根拠に、ユーザーの依頼に日本語で簡潔に答えてください。
+これらの発言を根拠に、ユーザーの依頼に求められている答えを、まず文章で簡潔に書いてください。
 
 ルール:
-- 根拠にした発言は、文末などに [番号] の形で引用する (例: 〜で決まった [3][5])
-- 会話に書かれていないことは推測で補わない
-- 「見つかりませんでした」「答えられません」で終わらせない。見つかった会話から分かることを中心に答え、足りない点があれば最後に一言だけ添える
-- 依頼が特定の話題を指定していない場合 (「#〇〇の内容をまとめて」「〇〇さんとの会話をまとめて」等) は、見つかった会話全体の要点を話題ごとにまとめる
-- 誰が何を言ったか・何が決まったか・未解決の点が分かるようにまとめる
-- 前置きは不要"""
+- 1文目から依頼への答えを書く (前置き・見出し・「以下にまとめます」等は不要)
+- {mode_rule}
+- 根拠にした発言は、その文の末尾に [番号] の形で付ける (例: 〜で決まりました [3][5])。番号は本当に根拠にしたものだけ
+- 会話に書かれていないことは推測で補わない。足りない点があっても「見つかりませんでした」で終わらせず、分かったことを中心に答え、必要なら最後に一言添える
+- ただし、見つかった会話に依頼の話題そのものがほとんど出てこない (関係の薄い会話しか無い) 場合は、無理に答えず「NEED_CLARIFY」とだけ出力する
+- 誰が何を言ったか・何が決まったか・未解決の点が分かるように書く
+- 普通の「です・ます」調。箇条書きは必要なときだけ"""
+
+NOT_FOUND = re.compile(r"見当たりません|見つかりません|確認できません|含まれていません|ありませんでした|分かりませんでした")
+LOCATE_RULE = "依頼は「その話をどこでしていたか」を知りたいもの。どのチャンネルで・いつ頃・誰が・どんな流れで話していたかを文章で答える"
+SUMMARIZE_RULE = "依頼は過去の会話の内容を知りたいもの。話題ごとに要点を整理して答える"
+
+CLARIFY_PROMPT = """あなたは Discord サーバーの過去ログを調べるアシスタントです。
+ユーザーの依頼について何往復も検索しましたが、答えるのに十分な会話が見つかりませんでした。
+ユーザーに聞き直すための、短く自然な質問を1〜3文で書いてください。
+- 何を補足してもらえれば探せるかを具体的に聞く (いつ頃の話か・どのチャンネルか・誰との話か・別の呼び方や関連する言葉など)
+- 「近い話題」として見つかった会話があれば、それかどうかを一言で確認してもよい
+- 謝罪や前置きは不要"""
 
 
 # 検索の依頼らしさの手がかり. これらを含まない投稿は振り分け (nano) を呼ばずに普通の質問として扱う
@@ -116,6 +128,33 @@ GENERIC_TOPIC = re.compile(r"の?(言動|発言|会話|話|内容|議論|やり�
 
 # 検索結果の並び順で「新しさ」をどれだけ重視するか (0〜1)
 RECENCY_WEIGHT = 0.4
+
+
+def cite(answer: str, messages: list[StoredMessage], title: str, prefix: str = "", max_refs: int = 6) -> str:
+    """回答中の [番号] を出てきた順の通し番号に振り直し、引用された発言をリンク付きで末尾に小さく添える.
+
+    本文は「求められている答え」(番号は短く)、末尾は「参考にした部分」という形にそろえる。
+    """
+    used: list[int] = []
+
+    def link(match: re.Match) -> str:
+        n = int(match.group(1))
+        if 1 <= n <= len(messages):
+            if n not in used:
+                used.append(n)
+            return f"[{prefix}{used.index(n) + 1}]"  # 本文は短い番号だけ (リンクは末尾の一覧に)
+        return ""
+
+    answer = re.sub(rf"\[{prefix}(\d{{1,3}})\](?!\()", link, answer).strip()
+    if not used:
+        return answer
+    refs = []
+    for k, n in enumerate(used[:max_refs], 1):
+        m = messages[n - 1]
+        snippet = re.sub(r"\s+", " ", m.content)
+        snippet = snippet[:40] + "…" if len(snippet) > 40 else snippet
+        refs.append(f"-# [{prefix}{k}] <#{m.channel_id}> {m.when} {m.author_name}「{snippet}」[→ 移動]({m.jump_url})")
+    return answer + f"\n\n-# {title}\n" + "\n".join(refs)
 
 
 @dataclass
@@ -284,7 +323,7 @@ class Searcher:
         if not hits and (req.since or req.until):
             log.info("期間内で見つからなかったため、全期間で再検索します")
             if progress:
-                await progress("期間を広げて探し直しています", "直近1年では見つからなかったので全期間を探します")
+                await progress("もっと前の会話まで広げて探しています")
             req.since = req.until = None
             hits = await self._search(req, channel_ids, guild_id, limit, question, progress, deadline)
         return hits
@@ -327,7 +366,7 @@ class Searcher:
         ))
         # まとめる場合は、前後の会話も読んで話の流れが途中で切れないようにする
         if req.type == "summarize" and top:
-            await report("前後の会話も読んでいます")
+            await report("話の流れをつかむため、前後の会話も読んでいます")
             for h in top:
                 prev_id, next_id = self.index.adjacent_chunks(h.chunk_id)
                 h.before = self.index.chunk_messages(prev_id)[-4:] if prev_id else []
@@ -348,6 +387,8 @@ class Searcher:
         pool: dict[int, Hit] = {}
         tried: list[str] = []
         queries = [(topic, list(req.keywords))]
+        # 根拠の確認に使う語 (元の依頼の話題と、その表記ゆれ)。後の往復で nano が足した一般的な語は含めない
+        evidence_keywords = {k for k in [topic, *req.keywords] if len(k) >= 2}
         ranked: list[Hit] = []
         broaden = [k for k, cond in (
             ("period", req.since is not None or req.until is not None),
@@ -360,8 +401,10 @@ class Searcher:
             before_ids = set(pool)
             for q, kws in queries:
                 tried.append(q)
-                shown = "」「".join(dict.fromkeys([q, *kws[:2]]))
-                await report(f"{rnd}回目: 「{shown}」で探しています")
+                if rnd == 1:
+                    await report(f"「{q}」の話を探しています")
+                else:
+                    await report(f"「{q}」という切り口でも探しています")
                 for h in await self._gather(q, kws, channel_ids, author_ids, req):
                     pool.setdefault(h.chunk_id, h)
             if pool:
@@ -369,11 +412,8 @@ class Searcher:
                 pool = {h.chunk_id: h for h in ranked[:24]}  # 元の依頼との関連が高い24件に絞る
             found = len(set(pool) - before_ids)
             stale = 0 if found else stale + 1
-            await report(
-                f"{rnd}回目の結果を確かめています",
-                f"{rnd}回目で関連しそうな会話が新たに{found}件見つかりました" if found
-                else f"{rnd}回目では新しい会話は見つかりませんでした",
-            )
+            if found:
+                await report(f"関連しそうな会話を{len(pool)}件見つけて、中身を確かめています")
             if rnd >= self.max_rounds:
                 break
             time_left = deadline is not None and deadline - time.monotonic() > 4
@@ -395,27 +435,33 @@ class Searcher:
                 step = broaden.pop(0)
                 if step == "period":
                     req.since = req.until = None
-                    await report("期間を広げて探し直しています", "期間を限定せずに探します")
+                    await report("もっと前の会話まで広げて探しています")
                 elif step == "channel":
                     channel_ids = set(all_channels)
-                    await report("ほかのチャンネルも探しています", "チャンネルを限定せずに探します")
+                    await report("ほかのチャンネルにも広げて探しています")
                 elif step == "person":
                     author_ids = None
-                    await report("ほかの人の発言も探しています", "発言者を限定せずに探します")
+                    await report("ほかの人の発言にも広げて探しています")
                 queries = [(topic, list(req.keywords)), *nexts[:1]]
                 stale = 0
                 continue
             if not nexts:
                 break
-            if decision.get("missing") and not sufficient:
-                await report("足りない情報を探しに行きます", f"不足: {str(decision['missing'])[:40]}")
+            missing = str(decision.get("missing") or "").strip().rstrip("。")
+            if missing and not sufficient:
+                await report(f"{missing}を探しに行きます" if len(missing) <= 28 else "まだ足りない情報を探しに行きます")
             elif sufficient:
-                await report("待ち時間を使って、さらに関連する話を探しています")
+                await report("念のため、関連する話がほかにないか探しています")
             queries = nexts
         if not pool:
             return None
-        await report(f"見つかった{len(pool)}件の会話を読んで絞り込んでいます")
+        await report("見つかった会話を読み比べて、関係あるものを選んでいます")
         top = await self._filter_relevant(req, ranked[:10])
+        # 根拠の確認: どの検索語も本文に出てこない (意味が近いだけの会話しか無い) なら、見つかっていない扱い
+        patterns = [keyword_pattern(k) for k in evidence_keywords]
+        if top and not any(p.search(m.content) for h in top for m in h.messages for p in patterns):
+            log.info("検索語を含む会話が無いため、十分な情報が見つからなかった扱いにします")
+            top = []
         if not top:
             # 完全に一致する会話が無くても、関連が高い会話を「近い話題」として出す
             top = ranked[:3]
@@ -581,25 +627,9 @@ class Searcher:
 
     @staticmethod
     def link_knowledge(answer: str, hits: list[Hit]) -> str:
-        """回答中の [参N] を発言へのリンクにし、参照した会話を末尾に添える."""
-        used = set()
-
-        def link(match: re.Match) -> str:
-            n = int(match.group(1))
-            if 1 <= n <= len(hits):
-                used.add(n)
-                m = hits[n - 1].best or hits[n - 1].messages[0]
-                return f"[[参{n}]]({m.jump_url})"
-            return ""
-
-        answer = re.sub(r"\[参(\d)\](?!\()", link, answer)
-        if not used:
-            return answer
-        refs = []
-        for n in sorted(used):
-            m = hits[n - 1].best or hits[n - 1].messages[0]
-            refs.append(f"[参{n}] <#{m.channel_id}> {m.when} {m.author_name} [→ 移動]({m.jump_url})")
-        return answer + "\n\n-# 参考にした過去の会話\n" + "\n".join(f"-# {r}" for r in refs)
+        """回答中の [参N] を発言へのリンクにし、参考にした過去の会話を末尾に添える."""
+        msgs = [h.best or h.messages[0] for h in hits]
+        return cite(answer, msgs, "参考にした過去の会話", prefix="参")
 
     async def _filter_relevant(
         self, req: SearchRequest, hits: list[Hit], prompt: str = RELEVANCE_PROMPT,
@@ -672,59 +702,53 @@ class Searcher:
             hit.best = pool[0]
 
     # --- 出力 ---
-    def format_locate(self, req: SearchRequest, hits: list[Hit]) -> str:
-        if hits and all(h.approx for h in hits):
-            lines = [f"🔍 **「{self._label(req)}」** にぴったり当てはまる発言は無かったので、近い話題の発言を挙げます"]
-        else:
-            lines = [f"🔍 **「{self._label(req)}」** に関する発言が見つかりました"]
-        for n, h in enumerate(hits, 1):
-            m = h.best or h.messages[0]
-            snippet = re.sub(r"\s+", " ", m.content)
-            if len(snippet) > 90:
-                snippet = snippet[:89] + "…"
-            lines.append(
-                f"\n**{n}.** <#{m.channel_id}> · {m.when} · **{m.author_name}**\n"
-                f"> {snippet}\n"
-                f"[→ この発言へ移動]({m.jump_url})"
-            )
-        return "\n".join(lines)
-
-    async def summarize(
+    async def compose(
         self, req: SearchRequest, hits: list[Hit], user_text: str, slot: float | None = None
     ) -> str:
-        """見つかった会話を mini でまとめ、[番号] を発言へのリンクに置き換える."""
+        """見つかった会話を根拠に、依頼への答えを mini が文章で書く. 末尾に参考にした発言を添える."""
         hits = sorted(hits, key=lambda h: h.messages[0].created_at)
         numbered: list[StoredMessage] = []
         blocks = []
         for h in hits:
             first = h.messages[0]
-            lines = [f"--- <#{first.channel_id}> {first.when} 〜 ---"]
+            lines = [f"--- #{first.channel_name} {first.when} 〜 ---"]
             for m in [*h.before, *h.messages, *h.after]:
                 numbered.append(m)
                 lines.append(f"[{len(numbered)}] {m.author_name}: {m.content}")
             blocks.append("\n".join(lines))
         context = "\n\n".join(blocks)[:12000]
+        rule = LOCATE_RULE if req.type == "locate" else SUMMARIZE_RULE
         answer = await self.sarashina.chat(
             [
-                {"role": "system", "content": SUMMARIZE_PROMPT},
-                {"role": "user", "content": f"# 依頼\n{user_text}\n\n# 検索条件\n{self._label(req)}\n\n# 見つかった会話\n{context}"},
+                {"role": "system", "content": ANSWER_PROMPT.format(mode_rule=rule)},
+                {"role": "user", "content": f"# 依頼\n{user_text}\n\n# 見つかった会話\n{context}"},
             ],
             temperature=0.3,
             slot=slot,
         )
+        # 十分な情報が無い → 呼び出し側で聞き直す (合図を出さずに「見当たらない」と書いてくる場合も含む)
+        # (1文目は「依頼への答え」と決めているので、1文目が「見当たらない」なら見つかっていない)
+        first_sentence = re.split(r"(?<=[。！？\n])", answer.strip(), maxsplit=1)[0]
+        if "NEED_CLARIFY" in answer or NOT_FOUND.search(first_sentence):
+            return ""
+        return cite(answer, numbered, "参考にした発言")
 
-        def link(match: re.Match) -> str:
-            n = int(match.group(1))
-            if 1 <= n <= len(numbered):
-                return f"[[{n}]]({numbered[n - 1].jump_url})"
-            return match.group(0)
-
-        answer = re.sub(r"\[(\d{1,3})\](?!\()", link, answer)
-        sources = [
-            f"- <#{h.messages[0].channel_id}> {h.messages[0].when} の会話 [→ 移動]({h.messages[0].jump_url})"
-            for h in hits
-        ]
-        return f"📝 **「{self._label(req)}」** に関する会話のまとめ\n\n{answer}\n\n-# 参照した会話\n" + "\n".join(sources)
+    async def clarify(
+        self, req: SearchRequest, hits: list[Hit], user_text: str, slot: float | None = None
+    ) -> str:
+        """十分な情報が見つからなかったとき、何を補足してほしいかを聞き直す."""
+        near = "\n".join(
+            f"- #{h.messages[0].channel_name} {h.messages[0].when}: {self._chunk_text(h.messages)[:120]}"
+            for h in hits[:3]
+        ) or "(なし)"
+        return await self.sarashina.chat(
+            [
+                {"role": "system", "content": CLARIFY_PROMPT},
+                {"role": "user", "content": f"# 依頼\n{user_text}\n\n# 近い話題として見つかった会話\n{near}"},
+            ],
+            temperature=0.3,
+            slot=slot,
+        )
 
     @staticmethod
     def _label(req: SearchRequest) -> str:

@@ -95,6 +95,7 @@ PHASES = {
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 LABEL_SECONDS = 3.0  # 見出しを切り替える間隔
+COMMENT_SECONDS = 10.0  # 検索中の「今何をしているか」の一言コメントを切り替える間隔
 BAR_CELLS = 14
 CURSOR = " ▌"
 
@@ -142,6 +143,8 @@ class ThinkingView:
         self.phase_started = self.started
         self.label: str | None = None  # このフェーズの、質問に合わせたラベル (無ければ汎用ラベル)
         self.cycle: list[str] = []  # 時間とともに切り替えるラベル (待ち時間中の思考表示など)
+        self._pending_comment: str | None = None  # 次に表示する一言コメント
+        self._comment_at = 0.0  # 最後に一言コメントを切り替えた時刻
         self.plan: dict[str, str] = {}  # 段階ごとの、質問に合わせたラベル
         self.topic = ""
         self.notes: list[str] = []  # 見つかったもの・状況のメモ (最新2件を表示)
@@ -161,6 +164,19 @@ class ThinkingView:
         self.phase_started = time.monotonic()
         self.label = label or self.plan.get(PHASE_STAGE.get(key, ""))
         self.cycle = [c for c in cycle or [] if c]
+
+    def comment(self, text: str, key: str = "search") -> None:
+        """今何をしているかの一言コメントを出す. 目まぐるしく変わらないよう、COMMENT_SECONDS 秒に1回まで.
+
+        それより早く次のコメントが来たら、最新のものを保留しておき、時間が来たら切り替える。
+        """
+        now = time.monotonic()
+        if self.phase != key or now - self._comment_at >= COMMENT_SECONDS:
+            self.set_phase(key, text)
+            self._comment_at = now
+            self._pending_comment = None
+        else:
+            self._pending_comment = text
 
     def thinking_labels(self, extra: list[str] | None = None) -> list[str]:
         """待ち時間中に見せる「考えている」ラベル (質問に合わせたもの優先)."""
@@ -219,10 +235,12 @@ class ThinkingView:
 
     def render(self) -> str:
         now = time.monotonic()
+        if self._pending_comment and now - self._comment_at >= COMMENT_SECONDS:
+            self.label, self._pending_comment, self._comment_at = self._pending_comment, None, now
         p = PHASES[self.phase]
         tick = int((now - self.phase_started) / LABEL_SECONDS)
         if self.cycle:
-            label = self.cycle[tick % len(self.cycle)]
+            label = self.cycle[int((now - self.phase_started) / COMMENT_SECONDS) % len(self.cycle)]
         else:
             label = self.label or p.labels[tick % len(p.labels)]
         spinner = SPINNER[self.frame % len(SPINNER)]

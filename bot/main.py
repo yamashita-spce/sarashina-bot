@@ -576,38 +576,39 @@ async def handle_search(
     message: discord.Message, req: SearchRequest, question: str, view: ThinkingView
 ) -> str:
     """過去の会話を検索し、リンク付きの結果 (locate) かまとめ (summarize) を返す."""
-    where = f"#{req.channel}" if req.channel else "サーバー全体"
     view.topic = searcher._label(req)[:20]
-    view.set_phase("search", f"{where}から「{searcher._label(req)[:16]}」を探しています")
+    view.comment(f"「{searcher._label(req)[:16]}」の話を探しています")
     allowed = searcher.allowed_channels(message.author, message.guild)
     if not allowed:
         return "⚠️ 検索できるチャンネルがありません。"
     limit = SEARCH_RESULTS if req.type == "locate" else 6
-    # まとめる場合は mini の回答枠を先に予約し、空くまでの時間も検索を続けて情報を厚くする
-    slot = sarashina.limiter().reserve() if req.type == "summarize" else None
+    # mini の回答枠を先に予約し、空くまでの時間も検索を続けて情報を厚くする
+    slot = sarashina.limiter().reserve()
 
     async def progress(label: str, note: str | None = None) -> None:
-        view.set_phase("search", label)
-        if note:
-            view.note(note)
+        view.comment(label)  # 一言コメント (10秒に1回まで切り替え)
 
     hits = await searcher.search(
         req, allowed, message.guild.id, limit, question=question, progress=progress, deadline=slot,
     )
     log.info("検索: %s → %d 件 (%s)", req, len(hits), req.type)
-    if not hits:
-        msgs, _ = search_index.stats()
-        note = "" if msgs else "\n-# まだ過去ログの索引付けが済んでいません。しばらくしてからお試しください。"
-        return f"🔍 「{searcher._label(req)}」に関する発言は見つかりませんでした。{note}"
+    if not hits or all(h.approx for h in hits):
+        # 何往復しても十分な情報が無い → 何を補足してほしいか聞き直す
+        slot = await wait_for_mini(view, ["十分な手がかりが無かったので、何が分かれば探せるか考えています"], slot=slot)
+        view.set_phase("summarize", "聞き直す内容を考えています")
+        return await searcher.clarify(req, hits, question, slot=slot)
     channels = "・".join(dict.fromkeys(f"#{h.messages[0].channel_name}" for h in hits))
-    view.note(f"{channels} で{len(hits)}件の会話が見つかりました")
-    if req.type == "locate":
-        return searcher.format_locate(req, hits)
-
+    view.note(f"{channels} などで{len(hits)}件の会話が見つかりました")
     slot = await wait_for_mini(view, [f"見つかった{len(hits)}件の会話を読み比べています",
                                       "話の流れを時系列に並べています"], slot=slot)
-    view.set_phase("summarize", f"見つかった{len(hits)}件の会話をまとめています")
-    return await searcher.summarize(req, hits, question, slot=slot)
+    view.set_phase("summarize", f"見つかった{len(hits)}件の会話から答えを書いています")
+    answer = await searcher.compose(req, hits, question, slot=slot)
+    if not answer:
+        # 会話を読んだ mini が「依頼に答えられる情報が無い」と判断 → 聞き直す
+        slot = await wait_for_mini(view, ["見つかった会話では答えきれないので、何が分かれば探せるか考えています"])
+        view.set_phase("summarize", "聞き直す内容を考えています")
+        return await searcher.clarify(req, hits, question, slot=slot)
+    return strip_stock_openers(answer)
 
 
 def setup_logging() -> None:
