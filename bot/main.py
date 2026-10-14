@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 import time
 from logging.handlers import TimedRotatingFileHandler
@@ -46,10 +47,44 @@ SARASHINA_API_KEY = env_required("SARASHINA_API_KEY")
 CHANNEL_IDS = {
     int(c) for c in os.getenv("DISCORD_CHANNEL_IDS", "").replace(" ", "").split(",") if c
 }
-SYSTEM_PROMPT = os.getenv(
-    "SYSTEM_PROMPT",
-    "あなたはDiscordサーバーで皆の質問に答える親切なアシスタントです。簡潔かつ正確に日本語で回答してください。",
+DEFAULT_SYSTEM_PROMPT = """あなたは「Sarashina」(SB Intuitions 開発の日本語 AI) です。この Discord サーバーのメンバーの質問や依頼に答えます。
+ユーザーの発言は「名前: 本文」の形で渡されます。
+
+回答のルール:
+- 直前までの会話の流れを最優先で踏まえる。「それ」「こういうところ」などの指示語や、前の回答への指摘・追加の依頼は、直前のやり取りから解釈する
+- 聞かれたことへの答えを最初に、簡潔かつ具体的に書く。依頼された作業 (書き直し・要約など) はそのまま実行する
+- 「ご指摘ありがとうございます」「真摯に受け止め」「寄り添う」のような前置き・お礼・謝罪・共感の決まり文句は書かない
+- 普通の「です・ます」調で書く。過剰な敬語や、抽象的・大げさな言い回しは使わない
+- 質問と関係のない過去の話題を持ち出さない
+- 分からないこと・できないことは正直にそう言う。批判されたら言い訳せず、内容で応える"""
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT
+# 最後のユーザー発言の直後に付ける短い確認 (小さいモデルはプロンプト末尾の指示ほど守るため)
+ANSWER_REMINDER = (
+    "\n\n---\n(回答前の確認: 前置き・お礼・謝罪は書かず、1文目から答えの本題を書く。"
+    "「これ」「こういうところ」などは直前の会話のどこを指しているかを先に特定してから答える)"
 )
+# モデルが癖で付けがちな決まり文句の書き出し (回答の先頭にあれば取り除く)
+STOCK_OPENERS = re.compile(
+    r"^(はい、?)?(ご質問の意図を(理解|汲み取り)[^。]*。|ご質問(いただき)?ありがとうございます。|お答えいたします。"
+    r"|かしこまりました。|承知(いた)?しました。|ご指摘(いただき)?ありがとうございます。|ご意見を受け取りました。)\s*"
+)
+RESTATEMENT = re.compile(r"^[^。\n]{0,80}(ということ|について|をお知りになりたい|を知りたい)ですね。\s*")
+
+
+def strip_stock_openers(text: str) -> str:
+    """「ご質問の意図を理解しました。〜についてですね。」のような書き出しを取り除く."""
+    original = text
+    for _ in range(3):
+        stripped = STOCK_OPENERS.sub("", text, count=1)
+        if stripped == text:
+            break
+        text = stripped
+        text = RESTATEMENT.sub("", text, count=1)
+    return text.strip() or original
+
+
+# 回答時に会話履歴としてそのまま渡す直近の発言数
+RECENT_TURNS = int(os.getenv("CONTEXT_RECENT_MESSAGES", "12"))
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "10"))
 MODEL = os.getenv("SARASHINA_MODEL", "sarashina3-mini")
 CONTEXT_ENABLED = os.getenv("CONTEXT_ENABLED", "true").lower() not in ("0", "false", "no")
@@ -80,7 +115,7 @@ sarashina = SarashinaClient(
     api_key=SARASHINA_API_KEY,
     model=MODEL,
     max_completion_tokens=int(os.getenv("SARASHINA_MAX_COMPLETION_TOKENS", "2000")),
-    temperature=float(os.getenv("SARASHINA_TEMPERATURE", "0.7")),
+    temperature=float(os.getenv("SARASHINA_TEMPERATURE", "0.5")),
     rpm=rpm_overrides,
 )
 # --- チャンネル横断検索 ---
@@ -100,7 +135,6 @@ contexts = ContextManager(
     sarashina,
     model=CONTEXT_MODEL,
     fetch_limit=int(os.getenv("CONTEXT_FETCH_LIMIT", "50")),
-    recent_raw=int(os.getenv("CONTEXT_RECENT_MESSAGES", "5")),
     max_chars=int(os.getenv("CONTEXT_SUMMARY_CHARS", "600")),
 )
 
@@ -315,7 +349,11 @@ async def on_message(message: discord.Message) -> None:
     if searcher:
         try:
             names = [c.name for c in message.guild.text_channels] if message.guild else []
-            request = await searcher.route(question, names)
+            recent = await contexts.recent_turns(message, 6)
+            request = await searcher.route(
+                question, names, asker=message.author.display_name, recent=recent,
+                guild_id=message.guild.id if message.guild else None,
+            )
         except Exception:
             log.exception("振り分けに失敗しました (通常の質問として扱います)")
     if request:
@@ -337,6 +375,10 @@ async def on_message(message: discord.Message) -> None:
                 ctx = await contexts.get(message)
                 context_block = contexts.build_context_block(ctx)
             history = await build_history(message)
+            recent = await contexts.recent_turns(message, RECENT_TURNS)
+            # 返信先が直近の範囲より古い場合だけ、返信チェーンを前に足す
+            recent_text = "\n".join(t["content"] for t in recent)
+            history = [h for h in history if h["content"] not in recent_text] + recent
         except Exception:
             log.exception("文脈の取得に失敗しました")
             history = []
@@ -371,7 +413,12 @@ async def on_message(message: discord.Message) -> None:
             "メモ自体や「質問の意図を理解しました」等の前置きには触れず、本題から答える。\n"
             + view.thinking_text
         )
-    messages = [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": question}]
+    asker = f"{message.author.display_name}: {question}{ANSWER_REMINDER}"
+    if history and history[-1]["role"] == "user":
+        history = [*history[:-1], {"role": "user", "content": history[-1]["content"] + "\n" + asker}]
+        messages = [{"role": "system", "content": system_prompt}, *history]
+    else:
+        messages = [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": asker}]
 
     try:
         answer = await sarashina.chat(messages, slot=slot)
@@ -382,6 +429,7 @@ async def on_message(message: discord.Message) -> None:
         log.exception("予期しないエラー")
         answer = "⚠️ 予期しないエラーが発生しました。"
     else:
+        answer = strip_stock_openers(answer)
         if THINKING_KEEP and THINKING_ENABLED:
             answer = f"{view.header}\n{answer}"
     finally:

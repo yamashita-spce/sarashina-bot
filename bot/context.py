@@ -112,12 +112,41 @@ class ContextManager:
         )
 
     def build_context_block(self, ctx: ChannelContext) -> str:
-        """システムプロンプトに追加する背景コンテキストのテキスト."""
-        if not ctx.summary and not ctx.recent:
+        """システムプロンプトに追加する、少し前までの会話の要約 (直近のやり取りは会話履歴として別に渡す)."""
+        if not ctx.summary:
             return ""
-        parts = ["以下はこのDiscordチャンネルの背景情報です。質問の文脈を理解するために参考にしてください。"]
-        if ctx.summary:
-            parts += ["", "## チャンネルの会話の要約", ctx.summary]
-        if ctx.recent:
-            parts += ["", "## 直近の発言", *ctx.recent]
-        return "\n".join(parts)
+        return (
+            "## 参考: このチャンネルの少し前までの会話の要約\n"
+            "質問がこれに関係する場合だけ使うこと。関係のない過去の話題を持ち出さない。\n"
+            + ctx.summary
+        )
+
+    async def recent_turns(self, message: discord.Message, limit: int) -> list[dict]:
+        """質問の直前 limit 件の発言を、そのままの会話履歴 (user/assistant のターン) にする.
+
+        他の人の発言は「名前: 本文」の user ターン、Bot 自身の回答は assistant ターン。
+        直近のやり取りを最優先で踏まえさせるため、要約ではなく生の発言を渡す。
+        """
+        msgs = [m async for m in message.channel.history(limit=limit + 5, before=message)][::-1]
+        turns: list[dict] = []
+        for m in msgs[-limit:]:
+            text = m.clean_content.strip()
+            if m.author.id == self.bot_user_id:
+                if not text or text[:1] in SPINNER:
+                    continue  # 処理中ステータスは除外
+                role, content = "assistant", text
+            else:
+                line = self.format_message(m)
+                if not line:
+                    continue
+                role, content = "user", line.split("] ", 1)[1]  # 「名前: 本文」
+            if len(content) > 1500:
+                content = content[:1500] + "…"
+            if turns and turns[-1]["role"] == role:
+                turns[-1]["content"] += "\n" + content  # 同じ役割が続く場合はまとめる
+            else:
+                turns.append({"role": role, "content": content})
+        # 会話履歴は user から始める
+        while turns and turns[0]["role"] == "assistant":
+            turns.pop(0)
+        return turns

@@ -214,6 +214,9 @@ class SearchIndex:
         if not len(idx):
             return []
         scores = self.matrix[idx] @ query_vec
+        # 新しい会話を少しだけ優遇する (類似度がほぼ同じなら新しい方を候補に残す)
+        age_days = np.maximum(0, (time.time() - self.chunk_times[idx]) / 86400)
+        scores = scores + 0.03 * np.power(0.5, age_days / 60)
         order = np.argsort(-scores)[:limit]
         return [(int(self.chunk_ids[idx[i]]), float(scores[i])) for i in order]
 
@@ -289,6 +292,15 @@ class SearchIndex:
             f"""SELECT DISTINCT author_id FROM messages
                 WHERE guild_id IN ({','.join('?' * len(guild_ids))}) AND author_name LIKE ?""",
             [*guild_ids, f"%{name}%"],
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def author_names(self, guild_id: int, limit: int = 60) -> list[str]:
+        """発言の多い順の発言者名 (振り分け時に人名を対応付けるため)."""
+        rows = self.db.execute(
+            """SELECT author_name, COUNT(*) AS c FROM messages WHERE guild_id = ?
+               GROUP BY author_name ORDER BY c DESC LIMIT ?""",
+            (guild_id, limit),
         ).fetchall()
         return [r[0] for r in rows]
 
