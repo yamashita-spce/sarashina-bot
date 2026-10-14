@@ -24,6 +24,8 @@ Discord の指定チャンネルの投稿に、国産LLM Sarashina (SB Intuition
 - **聞き直しは最終手段**（ユーザー要望: 簡単に聞き直さない・極力一発で答える）: `handle_search` は 通常検索→`compose_answer` → 答えられなければ `search(exhaustive=True)`（5往復固定・十分判定で止めない・条件を広げ切る・根拠語が無くても関連会話で答える）→`compose_answer` → それでもダメなら `clarify`。「十分」は nano 判定＋根拠語が本文にあること
 - **回答の精査**（ユーザー要望: 見つかったらすぐ答える癖をやめ、より良い答えか精査）: `Searcher.compose` が mini `chat_many(n=3)` で回答案を複数生成 → nano (`JUDGE_PROMPT`) が根拠・網羅性で審査して選択、`ComposeResult.missing/search` を返す → `handle_search` が欠けている観点を追加検索し、新規会話があれば `compose_answer(refine=True)` で書き直す（1回）。採用は「根拠と食い違う案を除き、回答度最大」（審査員の推しが僅差なら優先）
 - **回答度** = `SarashinaClient.answer_scores`: rerank `GENERAL_QA` のスコアを logit にしたもの。生スコアは 0.9999 に張り付くので logit 必須。「質問への答えになっているか」は測れる（答えている 13〜21 / 一部 10〜14 / 答えていない 2〜5）が、事実の正誤は測れない。ユーザー方針「正確さより質問への回答になっているかを見る」。普通の質問でも `check_and_revise` で回答度 < `ANSWER_MIN_SCORE`(7) なら書き直し
+- **質問の背景は必ず Discord の会話**（ユーザー要望・最重要）: 既定のシステムプロンプト冒頭に明記。検索の回答 (`Searcher.compose(background=...)`) にもチャンネルの直前の会話を渡す。RAG の `KNOWLEDGE_PROMPT` も「サーバー内で話題なら積極的に選ぶ」
+- **「詳しく」「複数」「全て」「N件」で収集量を増やす**（ユーザー要望）: `read_scope()`（nano の detail/breadth/count ＋手がかり語、多い方）→ `SearchRequest.budget`（`Budget.for_request`: 使う会話数・往復数・候補保持数・関連判定数・文脈文字数・回答トークン・1人あたり上限・書き方）。普通の質問でも RAG 件数と回答トークンに反映
 - **検索中の表示は一言コメントを10秒に1回まで**（ユーザー要望:「1回目:」のような表示はダサい）: `ThinkingView.comment()` が `COMMENT_SECONDS` で間引く。待機中の思考ラベルも10秒ごと
 - Bot と会話するチャンネルは索引しない（`Indexer.exclude_ids`、起動時に `purge_channel`）。依頼文が検索結果・次の検索語を汚染したため
 

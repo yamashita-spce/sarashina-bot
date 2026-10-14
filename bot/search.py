@@ -47,6 +47,9 @@ ROUTER_PROMPT = """あなたは Discord Bot の振り分け担当です。ユー
   "person": "特定の人の発言・その人との会話なら、発言者の名前の一覧の中から最も当てはまる名前 (無ければ null)",
   "channel": "特定のチャンネルの話なら、チャンネル一覧の中の名前 (無ければ null)",
   "order": "recent" または "relevance",
+  "detail": true または false,
+  "breadth": "one" または "several" または "all",
+  "count": 数 または null,
   "since": "YYYY-MM-DD または null",
   "until": "YYYY-MM-DD または null (この日を含まない)"}}
 
@@ -54,6 +57,9 @@ ROUTER_PROMPT = """あなたは Discord Bot の振り分け担当です。ユー
 - keywords は話題そのものを表す語を2〜5個 (表記ゆれ・言い換え・英語表記も含める)。人名や「話」「議論」「内容」「まとめ」「どこ」などの一般的な語は入れない
 - person は一覧の表記で返す。ローマ字・ニックネーム・苗字の読みなども考慮して対応付ける (例: 苗字「山田」→ 一覧の「yamada_x」)。「自分」「俺」なら質問者
 - order は「最近」「直近」「最新」「古すぎる」など新しさを求めていれば "recent"、それ以外は "relevance"
+- detail は「詳しく」「詳細に」「具体的に」「経緯も」など詳しさを求めていれば true
+- breadth は求めている量。「全て」「全部」「一覧」「洗いざらい」→ "all"、「複数」「いくつか」「色々」「どんな〜があった」→ "several"、それ以外は "one"
+- count は「3つ」「5件」など数が明示されていればその数、無ければ null
 - since/until は「先週」「10月」など期間が明示されている場合だけ設定し、それ以外は必ず null
 - 例: 「お知らせで告知してた内容をまとめて」→ channel="お知らせ・告知" (一覧にあるもの), query=""
 - 例: 「Aさんとキャッシュの設定について話したのどこ？」→ person="A", query="キャッシュの設定", type=locate
@@ -82,29 +88,32 @@ JSON だけを返す:
 
 KNOWLEDGE_PROMPT = """あなたは判定係です。ユーザーの質問と、サーバーの過去の会話の候補が与えられます。
 各候補は [候補番号] の見出しの後に、発言が (発言番号) 付きで並んでいます。
-質問に答えるのに実際に役立つ具体的な情報 (事実・決定事項・経験・意見) が発言の本文に書かれている候補だけを選び、
+質問はこのサーバーでの会話を背景にしています。質問に関係する具体的な情報 (事実・決定事項・経験・意見・その話題についてのやり取り) が
+発言の本文に書かれている候補は積極的に選び (一般常識で答えられる質問でも、サーバー内で話題になっていれば選ぶ)、
 (URL だけの発言はリンク先の内容が分からないので根拠にならない)
 その中で最も役立つ発言の番号を1つ選んでください。話題が少し似ているだけの候補は選ばないこと。
-挨拶・雑談・一般常識で答えられる質問なら、空配列を返すこと。
+挨拶や、サーバーの会話と関係しようのない質問 (単純な計算など) なら、空配列を返すこと。
 出力形式: {"results": [{"candidate": 候補番号, "message": 発言番号}, ...]}"""
 
 ANSWER_PROMPT = """あなたは Discord サーバーの過去ログを調べて答えるアシスタントです。
+質問は必ずこのサーバーでの会話を背景にしています。一般論ではなく、見つかった会話の内容で答えてください。
 以下は検索で見つかった過去の会話です。各発言の先頭に [番号] が付いています。
 これらの発言を根拠に、ユーザーの依頼に求められている答えを、まず文章で簡潔に書いてください。
 
 ルール:
-- 1文目から依頼への答えを書く (前置き・見出し・「以下にまとめます」等は不要)
-- {mode_rule}
+- 1文目から依頼への答えを書く (前置き・「以下にまとめます」等は不要)
+{mode_rule}
 - 根拠にした発言は、その文の末尾に [番号] の形で付ける (例: 〜で決まりました [3][5])。番号は本当に根拠にしたものだけ
 - 会話に書かれていないことは推測で補わない。足りない点があっても「見つかりませんでした」で終わらせず、分かったことを中心に答え、必要なら最後に一言添える
 - 直接の言及が無くても、関係する話・近い話があればそれを根拠に答える (「直接の言及はありませんが、〜」のように)
 - 見つかった会話が依頼とまったく無関係な場合に限り、「NEED_CLARIFY」とだけ出力する
 - 誰が何を言ったか・何が決まったか・未解決の点が分かるように書く
+- 見つかった会話に依頼と関係の無い話題 (同じ会話の中の雑談など) が混ざっていても、それは書かない
 - 普通の「です・ます」調。箇条書きは必要なときだけ"""
 
 NOT_FOUND = re.compile(r"見当たりません|見つかりません|確認できません|含まれていません|ありませんでした|分かりませんでした")
-LOCATE_RULE = "依頼は「その話をどこでしていたか」を知りたいもの。どのチャンネルで・いつ頃・誰が・どんな流れで話していたかを文章で答える"
-SUMMARIZE_RULE = "依頼は過去の会話の内容を知りたいもの。話題ごとに要点を整理して答える"
+LOCATE_RULE = "- 依頼は「その話をどこでしていたか」を知りたいもの。どのチャンネルで・いつ頃・誰が・どんな流れで話していたかを文章で答える"
+SUMMARIZE_RULE = "- 依頼は過去の会話の内容を知りたいもの。話題ごとに要点を整理して答える"
 
 JUDGE_PROMPT = """あなたは回答の審査員です。ユーザーの依頼、根拠となる過去の会話 (各発言に [番号])、
 AI が書いた回答案 (A, B, C ...) が与えられます。各回答案には「回答度」(質問への答えになっている度合い。
@@ -192,6 +201,75 @@ class SearchRequest:
     order: str = "relevance"  # relevance / recent
     since: float | None = None
     until: float | None = None
+    detail: bool = False  # 詳しさを求めている (「詳しく」「詳細に」)
+    breadth: str = "one"  # 求めている量: one / several / all (「複数」「全て」)
+    count: int | None = None  # 「3つ」など数の指定
+
+    @property
+    def budget(self) -> "Budget":
+        return Budget.for_request(self)
+
+
+@dataclass
+class Budget:
+    """質問が求める詳しさ・量に応じた、収集と回答の規模."""
+    results: int  # 回答に使う会話の数
+    min_rounds: int  # 検索の最低往復数
+    max_rounds: int  # 検索の最大往復数
+    pool: int  # 往復の間に保持する候補の数
+    judge: int  # 関連判定にかける候補の数
+    context_chars: int  # 回答に渡す会話の文字数
+    max_tokens: int  # 回答の最大トークン数
+    per_author: int  # 1人あたりの上限 (0 で無制限)
+    style: str  # 回答の書き方の指示
+
+    @staticmethod
+    def for_request(req: "SearchRequest") -> "Budget":
+        want = req.count or 0
+        if req.breadth == "all":
+            b = Budget(12, 4, 8, 48, 20, 24000, 4000, 0,
+                       "見つかったものを漏れなく列挙する。項目ごとに、いつ・どこで・誰が・何を、を添える")
+        elif req.breadth == "several" or want > 1:
+            b = Budget(8, 3, 7, 32, 14, 16000, 3000, 3,
+                       "該当するものを複数挙げ、それぞれ要点を書く")
+        else:
+            b = Budget(5, 2, 6, 24, 10, 12000, 2000, 2, "")
+        if want:
+            b.results = max(b.results, min(want + 2, 15))
+            b.style = f"{want}件を目安に挙げる。" + b.style
+        if req.detail:
+            b.min_rounds += 1
+            b.max_rounds += 1
+            b.context_chars = int(b.context_chars * 1.5)
+            b.max_tokens = max(b.max_tokens, 4000)
+            b.style = (b.style + "。" if b.style else "") + "詳しく書く。経緯・理由・具体的な発言内容まで含める"
+        return b
+
+
+# 「詳しく」「全て」など、求める詳しさ・量の手がかり (nano の判定を補う)
+DETAIL_CUES = re.compile(r"詳しく|詳細|具体的|くわしく|経緯|深掘り|細かく")
+ALL_CUES = re.compile(r"全て|すべて|全部|ぜんぶ|一覧|網羅|洗いざらい|漏れなく|もれなく|残らず|全件")
+SEVERAL_CUES = re.compile(r"複数|いくつか|色々|いろいろ|様々|さまざま|どんな.{0,6}(が|を)|何個か|何件か|他にも")
+COUNT_CUE = re.compile(r"(\d+|[一二三四五六七八九十])\s*(つ|個|件|点|人|選)")
+KANJI_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def read_scope(text: str, data: dict | None = None) -> tuple[bool, str, int | None]:
+    """質問から、求める詳しさ・量・数を読み取る (nano の判定と手がかり語の両方を使い、多い方に寄せる)."""
+    data = data or {}
+    detail = bool(data.get("detail")) or bool(DETAIL_CUES.search(text))
+    order = {"one": 0, "several": 1, "all": 2}
+    breadth = data.get("breadth") if data.get("breadth") in order else "one"
+    if ALL_CUES.search(text):
+        breadth = "all"
+    elif SEVERAL_CUES.search(text) and order[breadth] < 1:
+        breadth = "several"
+    count = data.get("count") if isinstance(data.get("count"), int) and data.get("count") > 0 else None
+    m = COUNT_CUE.search(text)
+    if m and not count:
+        n = m.group(1)
+        count = int(n) if n.isdigit() else KANJI_NUM.get(n)
+    return detail, breadth, count
 
 
 @dataclass
@@ -301,6 +379,7 @@ class Searcher:
             query = text
         if not keywords and query and len(query) <= 20:
             keywords = [query]
+        detail, breadth, count = read_scope(text, data)
         return SearchRequest(
             type="summarize" if data.get("type") == "summarize" else "locate",
             query=query,
@@ -310,6 +389,9 @@ class Searcher:
             order=order,
             since=_parse_date(data.get("since")),
             until=until,
+            detail=detail,
+            breadth=breadth,
+            count=count,
         )
 
     @staticmethod
@@ -416,8 +498,9 @@ class Searcher:
         - 通常: 根拠のある関連会話が無ければ approx を立てて返す (呼び出し側が粘り強いモードで探し直す)
         - exhaustive: 十分でも止めず exhaustive_rounds 回往復し、関連会話があれば根拠語が無くても返す
         """
-        min_rounds = self.exhaustive_rounds if exhaustive else self.min_rounds
-        max_rounds = self.exhaustive_rounds if exhaustive else self.max_rounds
+        budget = req.budget
+        min_rounds = max(self.exhaustive_rounds, budget.min_rounds) if exhaustive else max(self.min_rounds, budget.min_rounds)
+        max_rounds = max(self.exhaustive_rounds, budget.max_rounds) if exhaustive else max(self.max_rounds, budget.max_rounds)
         pool: dict[int, Hit] = {}
         tried: list[str] = []
         queries = [(topic, list(req.keywords))]
@@ -448,7 +531,7 @@ class Searcher:
                     pool.setdefault(h.chunk_id, h)
             if pool:
                 ranked = await self._rank(rerank_query, list(pool.values()))
-                pool = {h.chunk_id: h for h in ranked[:24]}  # 元の依頼との関連が高い24件に絞る
+                pool = {h.chunk_id: h for h in ranked[:budget.pool]}  # 元の依頼との関連が高いものに絞る
             found = len(set(pool) - before_ids)
             stale = 0 if found else stale + 1
             if found:
@@ -496,7 +579,7 @@ class Searcher:
         if not pool:
             return None
         await report("見つかった会話を読み比べて、関係あるものを選んでいます")
-        top = await self._filter_relevant(req, ranked[:10])
+        top = await self._filter_relevant(req, ranked[:budget.judge])
         # 通常モードでは、話題の語がどの本文にも出てこない (意味が近いだけ) なら根拠不足として扱い、
         # 呼び出し側に粘り強いモードでの探し直しを促す。粘り強いモードでは関連会話があればそれで答える
         if top and not exhaustive and not has_evidence(top):
@@ -543,8 +626,9 @@ class Searcher:
     async def _gather(self, query: str, keywords: list[str], channel_ids, author_ids, req) -> list[Hit]:
         """1つの検索語で、意味の近い会話 (embedding) とキーワードを含む会話を集める."""
         qvec = normalize(await self.sarashina.embed(query, "RETRIEVAL_QUERY"))
-        ids = [cid for cid, _ in self.index.vector_search(qvec, channel_ids, 15, req.since, req.until)]
-        ids += self.index.keyword_search(keywords or [query], channel_ids, 15, author_ids, req.since, req.until)
+        n = {"one": 15, "several": 20, "all": 30}.get(req.breadth, 15)
+        ids = [cid for cid, _ in self.index.vector_search(qvec, channel_ids, n, req.since, req.until)]
+        ids += self.index.keyword_search(keywords or [query], channel_ids, n, author_ids, req.since, req.until)
         hits = self._to_hits(ids, author_ids)
         if req.order == "recent":
             hits.sort(key=lambda h: -h.messages[-1].created_at)
@@ -587,13 +671,15 @@ class Searcher:
 
         人を指定した検索では制限しない。制限で足りなくなる場合は、後ろに回した結果で埋める。
         """
-        if author_ids or self.max_per_author <= 0:
+        # 「全て」は制限なし、「複数」は3件まで、それ以外は max_per_author 件まで
+        cap = {"all": 0, "several": 3}.get(req.breadth, self.max_per_author)
+        if author_ids or cap <= 0:
             return hits
         counts: dict[int, int] = {}
         picked, deferred = [], []
         for h in hits:
             m = h.best or max(h.messages, key=lambda x: len(x.content))
-            if counts.get(m.author_id, 0) >= self.max_per_author:
+            if counts.get(m.author_id, 0) >= cap:
                 deferred.append(h)
                 continue
             counts[m.author_id] = counts.get(m.author_id, 0) + 1
@@ -633,7 +719,7 @@ class Searcher:
             return []
         qvec = normalize(await self.sarashina.embed(question, "RETRIEVAL_QUERY"))
         hits = []
-        for cid, _ in self.index.vector_search(qvec, channel_ids, 15):
+        for cid, _ in self.index.vector_search(qvec, channel_ids, max(15, limit * 4)):
             msgs = self.index.chunk_messages(cid)
             if not msgs:
                 continue
@@ -644,7 +730,7 @@ class Searcher:
         if not hits:
             return []
         ranked = await self.sarashina.rerank(question, [self._chunk_text(h.messages) for h in hits])
-        ordered = [hits[i] for i, _ in ranked[:6]]
+        ordered = [hits[i] for i, _ in ranked[:max(6, limit * 2)]]
         picked = await self._filter_relevant(
             SearchRequest("locate", question), ordered, prompt=KNOWLEDGE_PROMPT, label="ユーザーの質問",
             keep_phrase=False,
@@ -682,14 +768,14 @@ class Searcher:
             lines = [f"[{n}]"]
             for k, m in enumerate(h.messages):
                 lines.append(f"({k}) {m.author_name}: {m.content[:200]}")
-            blocks.append("\n".join(lines)[:1500])
+            blocks.append("\n".join(lines)[:1500 if len(hits) <= 10 else 900])
         raw = await self.sarashina.chat(
             [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": f"# {label}\n{req.query}\n\n# 候補\n" + "\n\n".join(blocks)},
             ],
             model=self.router_model,
-            max_completion_tokens=300,
+            max_completion_tokens=600,
             temperature=0.0,
             response_format={"type": "json_object"},
         )
@@ -745,7 +831,7 @@ class Searcher:
     # --- 出力 ---
     async def compose(
         self, req: SearchRequest, hits: list[Hit], user_text: str, slot: float | None = None,
-        progress=None, candidates: int = 3,
+        progress=None, candidates: int = 3, background: str = "",
     ) -> ComposeResult:
         """見つかった会話を根拠に、依頼への答えを書く.
 
@@ -767,15 +853,23 @@ class Searcher:
                 numbered.append(m)
                 lines.append(f"[{len(numbered)}] {m.author_name}: {m.content}")
             blocks.append("\n".join(lines))
-        context = "\n\n".join(blocks)[:12000]
+        budget = req.budget
+        context = "\n\n".join(blocks)[:budget.context_chars]
         rule = LOCATE_RULE if req.type == "locate" else SUMMARIZE_RULE
+        if budget.style:
+            rule += "\n- 依頼が求める量・詳しさ: " + budget.style
+        prompt = f"# 依頼\n{user_text}\n\n"
+        if background:
+            prompt += f"# 依頼の背景 (このチャンネルの直前の会話。依頼の「それ」「さっきの」等はここから解釈する)\n{background}\n\n"
+        prompt += f"# 見つかった会話\n{context}"
         drafts = await self.sarashina.chat_many(
             [
                 {"role": "system", "content": ANSWER_PROMPT.format(mode_rule=rule)},
-                {"role": "user", "content": f"# 依頼\n{user_text}\n\n# 見つかった会話\n{context}"},
+                {"role": "user", "content": prompt},
             ],
             n=candidates,
             temperature=0.7 if candidates > 1 else 0.3,
+            max_completion_tokens=budget.max_tokens,
             slot=slot,
         )
         # 根拠が無いと書いてきた案は除く (1文目は「依頼への答え」と決めているので、1文目で判定)
@@ -788,7 +882,8 @@ class Searcher:
         if not usable:
             return ComposeResult("")
         if len(usable) == 1:
-            return ComposeResult(cite(usable[0], numbered, "参考にした発言"))
+            return ComposeResult(cite(usable[0], numbered, "参考にした発言",
+                                      max_refs={"all": 15, "several": 10}.get(req.breadth, 6)))
 
         await report(f"{len(usable)}通りの回答案を書いて、どれが質問に一番答えているか比べています")
         labels = "ABCDE"
@@ -806,7 +901,7 @@ class Searcher:
             raw = await self.sarashina.chat(
                 [
                     {"role": "system", "content": JUDGE_PROMPT},
-                    {"role": "user", "content": f"# 依頼\n{user_text}\n\n# 根拠となる会話\n{context[:8000]}\n\n# 回答案\n{listing}"},
+                    {"role": "user", "content": f"# 依頼\n{user_text}\n\n# 根拠となる会話\n{context[:16000]}\n\n# 回答案\n{listing}"},
                 ],
                 model=self.router_model, max_completion_tokens=800, temperature=0.0,
                 response_format={"type": "json_object"},
@@ -826,8 +921,9 @@ class Searcher:
         log.info("回答案 %d 通りから %s を選択 / 回答度 %s / 食い違い %s / 審査員の推し %s / 欠け: %s",
                  len(usable), labels[idx], {labels[i]: round(v, 1) for i, v in enumerate(scores)},
                  sorted(contradicts), best, judged.get("missing"))
+        max_refs = {"all": 15, "several": 10}.get(req.breadth, 6)
         return ComposeResult(
-            cite(usable[idx], numbered, "参考にした発言"),
+            cite(usable[idx], numbered, "参考にした発言", max_refs=max_refs),
             missing=str(judged.get("missing") or "").strip(),
             search=str(judged.get("search") or "").strip(),
         )

@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 from context import ContextManager
 from sarashina import SarashinaClient, SarashinaError
-from search import ComposeResult, SearchRequest, Searcher
+from search import ComposeResult, SearchRequest, Searcher, read_scope
 from search_index import Indexer, SearchIndex
 from thinking import (
     PLAN_LABELS_PROMPT,
@@ -51,6 +51,10 @@ CHANNEL_IDS = {
 }
 DEFAULT_SYSTEM_PROMPT = """あなたは「Sarashina」(SB Intuitions 開発の日本語 AI) です。この Discord サーバーのメンバーの質問や依頼に答えます。
 ユーザーの発言は「名前: 本文」の形で渡されます。
+
+最重要: 質問は必ずこのサーバーでの会話を背景にしています。まず直前の会話・チャンネルの要約・
+過去の関連する会話 (参考情報として渡される) から質問の意味を解釈し、そこに情報があればそれを根拠に答えてください。
+サーバーの会話に情報が無い一般的な質問のときだけ、一般的な知識で答えます。
 
 回答のルール:
 - 直前までの会話の流れを最優先で踏まえる。「それ」「こういうところ」などの指示語や、前の回答への指摘・追加の依頼は、直前のやり取りから解釈する
@@ -436,9 +440,11 @@ async def on_message(message: discord.Message) -> None:
                 view.set_phase("search")
                 allowed = searcher.allowed_channels(message.author, message.guild)
                 if allowed:
+                    detail, breadth, count = read_scope(question)
                     knowledge = await searcher.related(
                         question, allowed,
                         exclude_after=time.time() - 3600, exclude_channel=message.channel.id,
+                        limit={"all": 8, "several": 5}.get(breadth, 3 if not detail else 5),
                     )
                     if knowledge:
                         log.info("RAG: %d 件の過去の会話を参考にします", len(knowledge))
@@ -482,8 +488,11 @@ async def on_message(message: discord.Message) -> None:
     else:
         messages = [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": asker}]
 
+    detail, breadth, _ = read_scope(question)
     try:
-        answer = await sarashina.chat(messages, slot=slot)
+        answer = await sarashina.chat(
+            messages, slot=slot, max_completion_tokens=4000 if (detail or breadth == "all") else None,
+        )
         if ANSWER_CHECK_ENABLED:
             answer = await check_and_revise(view, messages, answer, question)
     except SarashinaError as e:
@@ -604,7 +613,20 @@ async def handle_search(
     allowed = searcher.allowed_channels(message.author, message.guild)
     if not allowed:
         return "⚠️ 検索できるチャンネルがありません。"
-    limit = SEARCH_RESULTS if req.type == "locate" else 6
+    limit = max(SEARCH_RESULTS if req.type == "locate" else 6, req.budget.results)
+    # 質問の背景 (このチャンネルの直前の会話)。依頼の「それ」「さっきの」等を解釈するために回答にも渡す
+    try:
+        recent = await contexts.recent_turns(message, 8)
+    except Exception:
+        recent = []
+    background = "\n".join(
+        ("Bot" if t["role"] == "assistant" else "") + (": " if t["role"] == "assistant" else "") + t["content"][:300]
+        for t in recent
+    )
+    if req.detail or req.breadth != "one" or req.count:
+        scope = [w for w, on in (("詳しく", req.detail), ("全部", req.breadth == "all"),
+                                 ("複数", req.breadth == "several"), (f"{req.count}件", bool(req.count))) if on]
+        view.note(f"「{'・'.join(scope)}」とのことなので、多めに集めます")
     # mini の回答枠を先に予約し、空くまでの時間も検索を続けて情報を厚くする
     slot = sarashina.limiter().reserve()
 
@@ -617,7 +639,7 @@ async def handle_search(
     log.info("検索: %s → %d 件 (%s)", req, len(hits), req.type)
     result = ComposeResult("")
     if hits and not all(h.approx for h in hits):
-        result = await compose_answer(view, req, hits, question, slot, progress)
+        result = await compose_answer(view, req, hits, question, slot, progress, background=background)
         slot = None
     if not result.answer:
         # 通常の検索で答えられなかった → 十分かどうかに関わらず5往復、条件も広げ切って粘り強く探す
@@ -628,7 +650,7 @@ async def handle_search(
         )
         log.info("粘り強い検索: %d 件 (近い話題のみ=%s)", len(hits), all(h.approx for h in hits))
         if hits and not all(h.approx for h in hits):
-            result = await compose_answer(view, req, hits, question, slot, progress)
+            result = await compose_answer(view, req, hits, question, slot, progress, background=background)
             slot = None
     if result.answer and result.search and ANSWER_REFINE_ENABLED:
         # 審査で「大事な観点が欠けている」と判定 → その観点で追加検索し、集め直して書き直す (1回まで)
@@ -636,13 +658,14 @@ async def handle_search(
         view.comment(f"「{result.missing[:20]}」が足りないので、追加で探しています" if result.missing
                      else "足りない観点を追加で探しています")
         extra_req = SearchRequest(req.type, result.search, result.search.split()[:6], person=req.person,
-                                  channel=req.channel)
+                                  channel=req.channel, detail=req.detail, breadth=req.breadth)
         extra = await searcher.search(extra_req, allowed, message.guild.id, 3, question=question, progress=progress)
         known = {h.chunk_id for h in hits}
         added = [h for h in extra if not h.approx and h.chunk_id not in known]
         if added:
             view.note(f"足りなかった観点について{len(added)}件の会話を追加しました")
-            refined = await compose_answer(view, req, hits + added, question, None, progress, refine=True)
+            refined = await compose_answer(view, req, hits + added, question, None, progress, refine=True,
+                                           background=background)
             if refined.answer:
                 result = refined
     if result.answer:
@@ -655,7 +678,7 @@ async def handle_search(
 
 async def compose_answer(
     view: ThinkingView, req: SearchRequest, hits: list, question: str, slot: float | None,
-    progress=None, refine: bool = False,
+    progress=None, refine: bool = False, background: str = "",
 ) -> ComposeResult:
     """見つかった会話から mini が回答案を複数書き、審査で一番良いものを選ぶ (根拠が無ければ空)."""
     if not refine:
@@ -666,7 +689,7 @@ async def compose_answer(
     view.comment("集めた会話を踏まえて、回答を書き直しています" if refine
                  else f"見つかった{len(hits)}件の会話から回答案を書いています")
     result = await searcher.compose(req, hits, question, slot=slot, progress=progress,
-                                    candidates=ANSWER_CANDIDATES)
+                                    candidates=ANSWER_CANDIDATES, background=background)
     result.answer = strip_stock_openers(result.answer) if result.answer else ""
     return result
 
