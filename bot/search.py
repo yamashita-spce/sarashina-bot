@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -66,6 +67,19 @@ RELEVANCE_PROMPT = """あなたは検索結果の判定係です。ユーザー�
 関連が強い順に並べ、JSON だけを返してください。該当がなければ空配列。
 出力形式: {"results": [{"candidate": 候補番号, "message": 発言番号}, ...]}"""
 
+NEXT_QUERY_PROMPT = """あなたはサーバーの過去ログを調べる検索担当です。ユーザーの依頼、これまでに試した検索語、
+これまでに見つかった会話の抜粋 (関連が高そうな順) が与えられます。
+
+1. 見つかった会話で依頼に十分答えられるかを判断する
+2. 足りなければ、まだ見つかっていない情報を見つけるための次の検索を最大2つ提案する
+   - 言い換え・類義語・関連する固有名詞 (店名・製品名・サービス名など)・英語/カタカナ表記・略称
+   - 見つかった会話に出てきた手がかり (関連する話題・名前) を使って広げる
+   - 既に試した検索語と同じ・ほぼ同じものは出さない
+{extra}
+JSON だけを返す:
+{{"sufficient": true または false, "missing": "まだ足りない情報 (十分なら空文字)",
+ "next": [{{"query": "次の検索語 (短く)", "keywords": ["本文に含まれていそうな語", ...]}}, ...]}}"""
+
 KNOWLEDGE_PROMPT = """あなたは判定係です。ユーザーの質問と、サーバーの過去の会話の候補が与えられます。
 各候補は [候補番号] の見出しの後に、発言が (発言番号) 付きで並んでいます。
 質問に答えるのに実際に役立つ具体的な情報 (事実・決定事項・経験・意見) が発言の本文に書かれている候補だけを選び、
@@ -81,6 +95,7 @@ SUMMARIZE_PROMPT = """あなたは Discord サーバーの過去ログを調べ�
 ルール:
 - 根拠にした発言は、文末などに [番号] の形で引用する (例: 〜で決まった [3][5])
 - 会話に書かれていないことは推測で補わない
+- 「見つかりませんでした」「答えられません」で終わらせない。見つかった会話から分かることを中心に答え、足りない点があれば最後に一言だけ添える
 - 依頼が特定の話題を指定していない場合 (「#〇〇の内容をまとめて」「〇〇さんとの会話をまとめて」等) は、見つかった会話全体の要点を話題ごとにまとめる
 - 誰が何を言ったか・何が決まったか・未解決の点が分かるようにまとめる
 - 前置きは不要"""
@@ -121,6 +136,9 @@ class Hit:
     score: float
     messages: list[StoredMessage]
     best: StoredMessage | None = None
+    before: list[StoredMessage] = field(default_factory=list)  # 前の会話 (まとめる時の文脈用)
+    after: list[StoredMessage] = field(default_factory=list)  # 後の会話
+    approx: bool = False  # 完全には一致しないが近い話題として出す結果
 
 
 def _parse_date(s) -> float | None:
@@ -137,6 +155,7 @@ class Searcher:
         self, sarashina: SarashinaClient, index: SearchIndex,
         router_model: str = "sarashina3-nano", results: int = 5,
         default_days: float = 365, max_per_author: int = 2,
+        min_rounds: int = 2, max_rounds: int = 4,
     ) -> None:
         self.sarashina = sarashina
         self.index = index
@@ -144,6 +163,8 @@ class Searcher:
         self.results = results
         self.default_days = default_days  # 期間指定が無いときに探す範囲 (日)
         self.max_per_author = max_per_author  # 結果に同じ人の発言が並びすぎないように
+        self.min_rounds = min_rounds  # 検索を最低何往復するか
+        self.max_rounds = max_rounds  # 検索を最大何往復するか
 
     async def route(
         self, text: str, channel_names: list[str] | None = None, asker: str = "",
@@ -247,7 +268,10 @@ class Searcher:
                 allowed.add(ch.id)
         return allowed
 
-    async def search(self, req: SearchRequest, channel_ids: set[int], guild_id: int, limit: int) -> list[Hit]:
+    async def search(
+        self, req: SearchRequest, channel_ids: set[int], guild_id: int, limit: int,
+        question: str = "", progress=None, deadline: float | None = None,
+    ) -> list[Hit]:
         """候補を集めて並べ替える.
 
         期間の指定が無ければ直近 default_days 日を探し、見つからなければ全期間で探し直す。
@@ -256,18 +280,153 @@ class Searcher:
         explicit = req.since is not None or req.until is not None
         if not explicit and self.default_days:
             req.since = datetime.now().timestamp() - self.default_days * 86400
-        hits = await self._search(req, channel_ids, guild_id, limit)
+        hits = await self._search(req, channel_ids, guild_id, limit, question, progress, deadline)
         if not hits and (req.since or req.until):
             log.info("期間内で見つからなかったため、全期間で再検索します")
+            if progress:
+                await progress("期間を広げて探し直しています", "直近1年では見つからなかったので全期間を探します")
             req.since = req.until = None
-            hits = await self._search(req, channel_ids, guild_id, limit)
+            hits = await self._search(req, channel_ids, guild_id, limit, question, progress, deadline)
         return hits
 
-    async def _search(self, req: SearchRequest, channel_ids: set[int], guild_id: int, limit: int) -> list[Hit]:
-        """埋め込み検索とキーワード検索で候補を集め、rerank → 関連判定で絞り込む."""
+    async def _search(
+        self, req: SearchRequest, channel_ids: set[int], guild_id: int, limit: int,
+        question: str = "", progress=None, deadline: float | None = None,
+    ) -> list[Hit]:
+        """何往復かして候補を集め、rerank → 関連判定で絞り込む.
+
+        1回目は依頼の話題で探し、2回目以降は nano が「足りない情報」と次の検索語 (言い換え・関連語・
+        見つかった会話に出てきた手がかり) を考えて探し直す。最低 min_rounds 回、最大 max_rounds 回。
+        """
+        async def report(label: str, note: str | None = None) -> None:
+            if progress:
+                await progress(label, note)
+
+        all_channels = set(channel_ids)
+        author_ids, channel_ids = self._resolve(req, channel_ids, guild_id)
+        topic = req.query.strip()
+        rerank_query = topic or req.person or req.channel or ""
+
+        if not topic:
+            # 話題の指定が無い (「〇〇さんの発言」「#お知らせの内容」等) 場合は、条件に合う最近の会話
+            await report("条件に合う最近の会話を集めています")
+            pool = self._to_hits(
+                self.index.recent_chunks(channel_ids, 20, author_ids, req.since, req.until), author_ids)
+            top = sorted(pool, key=lambda h: -h.messages[-1].created_at)[:limit]
+        else:
+            top = await self._deep_search(
+                req, topic, rerank_query, channel_ids, all_channels, author_ids, limit, question,
+                report, deadline,
+            )
+            if top is None:
+                return []
+
+        # 関連判定でリンク先が決まらなかった会話は、キーワード/rerank で発言を特定する
+        await asyncio.gather(*(
+            self._pick_best(rerank_query, h, author_ids, req.keywords) for h in top if h.best is None
+        ))
+        # まとめる場合は、前後の会話も読んで話の流れが途中で切れないようにする
+        if req.type == "summarize" and top:
+            await report("前後の会話も読んでいます")
+            for h in top:
+                prev_id, next_id = self.index.adjacent_chunks(h.chunk_id)
+                h.before = self.index.chunk_messages(prev_id)[-4:] if prev_id else []
+                h.after = self.index.chunk_messages(next_id)[:4] if next_id else []
+        return top
+
+    async def _deep_search(
+        self, req: SearchRequest, topic: str, rerank_query: str, channel_ids: set[int],
+        all_channels: set[int], author_ids, limit: int, question: str, report, deadline: float | None,
+    ) -> list[Hit] | None:
+        """十分な情報が集まるまで何往復も検索する.
+
+        - 2回目以降は nano が「足りない情報」と次の検索語 (言い換え・関連語・手がかり) を考える
+        - 言い換えで新しい会話が見つからなくなったら、条件を広げる (期間 → チャンネル → 人)
+        - deadline (mini の回答枠が空く時刻) までは、十分でも検索を続けて情報を厚くする
+        - 最後まで一致する会話が無くても、近い話題の会話を「近い話題」として返す (諦めない)
+        """
+        pool: dict[int, Hit] = {}
+        tried: list[str] = []
+        queries = [(topic, list(req.keywords))]
+        ranked: list[Hit] = []
+        broaden = [k for k, cond in (
+            ("period", req.since is not None or req.until is not None),
+            ("channel", channel_ids != all_channels),
+            ("person", bool(author_ids)),
+        ) if cond]
+        rnd, stale = 0, 0
+        while rnd < self.max_rounds:
+            rnd += 1
+            before_ids = set(pool)
+            for q, kws in queries:
+                tried.append(q)
+                shown = "」「".join(dict.fromkeys([q, *kws[:2]]))
+                await report(f"{rnd}回目: 「{shown}」で探しています")
+                for h in await self._gather(q, kws, channel_ids, author_ids, req):
+                    pool.setdefault(h.chunk_id, h)
+            if pool:
+                ranked = await self._rank(rerank_query, list(pool.values()))
+                pool = {h.chunk_id: h for h in ranked[:24]}  # 元の依頼との関連が高い24件に絞る
+            found = len(set(pool) - before_ids)
+            stale = 0 if found else stale + 1
+            await report(
+                f"{rnd}回目の結果を確かめています",
+                f"{rnd}回目で関連しそうな会話が新たに{found}件見つかりました" if found
+                else f"{rnd}回目では新しい会話は見つかりませんでした",
+            )
+            if rnd >= self.max_rounds:
+                break
+            time_left = deadline is not None and deadline - time.monotonic() > 4
+            decision = await self._next_queries(
+                question or topic, tried, ranked[:8], must_continue=rnd < self.min_rounds or time_left)
+            nexts = [
+                (n["query"].strip(), [k for k in n.get("keywords") or [] if isinstance(k, str)])
+                for n in decision.get("next") or []
+                if isinstance(n, dict) and isinstance(n.get("query"), str) and n["query"].strip()
+                and n["query"].strip() not in tried
+            ][:2]
+            sufficient = bool(decision.get("sufficient")) and bool(pool)
+            log.info("検索 %d 回目: %d 件 (新規 %d) / 十分=%s / 次: %s", rnd, len(pool), found,
+                     sufficient, [q for q, _ in nexts])
+            if sufficient and rnd >= self.min_rounds and not time_left:
+                break
+            # 言い換えでも新しい会話が見つからない → 条件を広げて探し直す
+            if (stale >= 2 or not nexts or not pool) and broaden:
+                step = broaden.pop(0)
+                if step == "period":
+                    req.since = req.until = None
+                    await report("期間を広げて探し直しています", "期間を限定せずに探します")
+                elif step == "channel":
+                    channel_ids = set(all_channels)
+                    await report("ほかのチャンネルも探しています", "チャンネルを限定せずに探します")
+                elif step == "person":
+                    author_ids = None
+                    await report("ほかの人の発言も探しています", "発言者を限定せずに探します")
+                queries = [(topic, list(req.keywords)), *nexts[:1]]
+                stale = 0
+                continue
+            if not nexts:
+                break
+            if decision.get("missing") and not sufficient:
+                await report("足りない情報を探しに行きます", f"不足: {str(decision['missing'])[:40]}")
+            elif sufficient:
+                await report("待ち時間を使って、さらに関連する話を探しています")
+            queries = nexts
+        if not pool:
+            return None
+        await report(f"見つかった{len(pool)}件の会話を読んで絞り込んでいます")
+        top = await self._filter_relevant(req, ranked[:10])
+        if not top:
+            # 完全に一致する会話が無くても、関連が高い会話を「近い話題」として出す
+            top = ranked[:3]
+            for h in top:
+                h.approx = True
+        return self._diversify(req, self._order(req, top), author_ids)[:limit]
+
+    def _resolve(self, req: SearchRequest, channel_ids: set[int], guild_id: int):
+        """人名・チャンネル名を ID に解決する. 見つからなければ話題の一部として扱う."""
         author_ids = self.index.find_authors(req.person, {guild_id}) if req.person else None
         if req.person and not author_ids:
-            # 人名として見つからなければ話題の一部として扱う
             if req.person not in req.query:
                 req.query = f"{req.person} {req.query}".strip()
             if req.person not in req.keywords:
@@ -278,61 +437,63 @@ class Searcher:
             if named:
                 channel_ids = named
             else:
-                # チャンネル名として見つからなければ話題の一部として扱う
                 req.query = f"{req.channel} {req.query}".strip()
                 req.keywords.append(req.channel)
+        return author_ids, channel_ids
 
-        topic = req.query.strip()
-        candidates: list[int] = []
-        if topic:
-            qvec = normalize(await self.sarashina.embed(topic, "RETRIEVAL_QUERY"))
-            candidates += [cid for cid, _ in self.index.vector_search(qvec, channel_ids, 30, req.since, req.until)]
-            candidates += self.index.keyword_search(
-                req.keywords, channel_ids, 30, author_ids, req.since, req.until)
-        else:
-            # 話題の指定が無い (「〇〇さんとの会話」「#お知らせの内容」等) 場合は、条件に合う最近の会話
-            candidates += self.index.recent_chunks(channel_ids, 20, author_ids, req.since, req.until)
-
-        # 重複を除き、人の指定があればその人が参加している会話に絞る
-        hits: list[Hit] = []
-        seen = set()
-        for cid in candidates:
+    def _to_hits(self, chunk_ids: list[int], author_ids) -> list[Hit]:
+        hits, seen = [], set()
+        for cid in chunk_ids:
             if cid in seen:
                 continue
             seen.add(cid)
             msgs = self.index.chunk_messages(cid)
-            if not msgs:
-                continue
-            if author_ids and not any(m.author_id in author_ids for m in msgs):
+            if not msgs or (author_ids and not any(m.author_id in author_ids for m in msgs)):
                 continue
             hits.append(Hit(cid, 0.0, msgs))
-        if not hits:
-            return []
+        return hits
 
-        # 会話 (チャンク) 単位で rerank. 「最近の」指定なら新しい候補を優先して rerank に回す
+    async def _gather(self, query: str, keywords: list[str], channel_ids, author_ids, req) -> list[Hit]:
+        """1つの検索語で、意味の近い会話 (embedding) とキーワードを含む会話を集める."""
+        qvec = normalize(await self.sarashina.embed(query, "RETRIEVAL_QUERY"))
+        ids = [cid for cid, _ in self.index.vector_search(qvec, channel_ids, 15, req.since, req.until)]
+        ids += self.index.keyword_search(keywords or [query], channel_ids, 15, author_ids, req.since, req.until)
+        hits = self._to_hits(ids, author_ids)
         if req.order == "recent":
             hits.sort(key=lambda h: -h.messages[-1].created_at)
-        hits = hits[:20]
-        rerank_query = topic or req.person or req.channel or ""
-        docs = [self._chunk_text(h.messages) for h in hits]
-        ranked = await self.sarashina.rerank(rerank_query, docs)
-        ordered = []
-        for i, score in ranked:
-            hits[i].score = score
-            ordered.append(hits[i])
+        return hits
 
-        # rerank のスコアは無関係な候補でも高く出るため、上位候補を nano で関連あり/なし判定する
-        if topic:
-            top = await self._filter_relevant(req, ordered[:8])
-        else:
-            top = list(hits)  # 話題なしの指定は、条件に合う会話をそのまま使う
-        top = self._diversify(req, self._order(req, top), author_ids)[:limit]
+    async def _rank(self, query: str, hits: list[Hit]) -> list[Hit]:
+        """rerank (20件ずつ) で元の依頼との関連度順に並べる."""
+        for k in range(0, len(hits), 20):
+            batch = hits[k:k + 20]
+            for i, score in await self.sarashina.rerank(query, [self._chunk_text(h.messages) for h in batch]):
+                batch[i].score = score
+        return sorted(hits, key=lambda h: -h.score)
 
-        # 関連判定でリンク先が決まらなかった会話は、キーワード/rerank で発言を特定する
-        await asyncio.gather(*(
-            self._pick_best(rerank_query, h, author_ids, req.keywords) for h in top if h.best is None
-        ))
-        return top
+    async def _next_queries(
+        self, question: str, tried: list[str], top: list[Hit], must_continue: bool = False
+    ) -> dict:
+        """見つかった会話で足りるかを nano に判定させ、足りなければ次の検索語を出させる."""
+        listing = "\n\n".join(
+            f"[{n}] #{h.messages[0].channel_name} {h.messages[0].when}\n{self._chunk_text(h.messages)[:400]}"
+            for n, h in enumerate(top)
+        ) or "(まだ見つかっていない)"
+        try:
+            raw = await self.sarashina.chat(
+                [
+                    {"role": "system", "content": NEXT_QUERY_PROMPT.format(extra=(
+                        "※ まだ検索が足りないので、十分かどうかに関わらず、次の検索を必ず1つ以上提案すること。"
+                        if must_continue else ""))},
+                    {"role": "user", "content": f"# 依頼\n{question}\n\n# 試した検索語\n{', '.join(tried)}\n\n# 見つかった会話\n{listing}"},
+                ],
+                model=self.router_model, max_completion_tokens=400, temperature=0.3,
+                response_format={"type": "json_object"},
+            )
+            return json.loads(raw)
+        except Exception:
+            log.warning("次の検索語の生成に失敗しました", exc_info=True)
+            return {"sufficient": True, "next": []}
 
     def _diversify(self, req: SearchRequest, hits: list[Hit], author_ids) -> list[Hit]:
         """同じ人の発言ばかりにならないよう、1人あたり max_per_author 件までにする.
@@ -512,7 +673,10 @@ class Searcher:
 
     # --- 出力 ---
     def format_locate(self, req: SearchRequest, hits: list[Hit]) -> str:
-        lines = [f"🔍 **「{self._label(req)}」** に関する発言が見つかりました"]
+        if hits and all(h.approx for h in hits):
+            lines = [f"🔍 **「{self._label(req)}」** にぴったり当てはまる発言は無かったので、近い話題の発言を挙げます"]
+        else:
+            lines = [f"🔍 **「{self._label(req)}」** に関する発言が見つかりました"]
         for n, h in enumerate(hits, 1):
             m = h.best or h.messages[0]
             snippet = re.sub(r"\s+", " ", m.content)
@@ -535,7 +699,7 @@ class Searcher:
         for h in hits:
             first = h.messages[0]
             lines = [f"--- <#{first.channel_id}> {first.when} 〜 ---"]
-            for m in h.messages:
+            for m in [*h.before, *h.messages, *h.after]:
                 numbered.append(m)
                 lines.append(f"[{len(numbered)}] {m.author_name}: {m.content}")
             blocks.append("\n".join(lines))

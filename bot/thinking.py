@@ -141,6 +141,7 @@ class ThinkingView:
         self.phase = "context"
         self.phase_started = self.started
         self.label: str | None = None  # このフェーズの、質問に合わせたラベル (無ければ汎用ラベル)
+        self.cycle: list[str] = []  # 時間とともに切り替えるラベル (待ち時間中の思考表示など)
         self.plan: dict[str, str] = {}  # 段階ごとの、質問に合わせたラベル
         self.topic = ""
         self.notes: list[str] = []  # 見つかったもの・状況のメモ (最新2件を表示)
@@ -150,11 +151,24 @@ class ThinkingView:
         self.frame = 0
         self.thinking_seconds: float | None = None
 
-    def set_phase(self, key: str, label: str | None = None) -> None:
-        """フェーズを切り替える. label を省略すると、作業計画のラベル → 汎用ラベルの順に使う."""
+    def set_phase(self, key: str, label: str | None = None, cycle: list[str] | None = None) -> None:
+        """フェーズを切り替える.
+
+        label を省略すると、作業計画のラベル → 汎用ラベルの順に使う。
+        cycle を渡すと、そのラベルを数秒ごとに切り替えて表示する。
+        """
         self.phase = key
         self.phase_started = time.monotonic()
         self.label = label or self.plan.get(PHASE_STAGE.get(key, ""))
+        self.cycle = [c for c in cycle or [] if c]
+
+    def thinking_labels(self, extra: list[str] | None = None) -> list[str]:
+        """待ち時間中に見せる「考えている」ラベル (質問に合わせたもの優先)."""
+        topic = self.topic or "質問"
+        labels = [self.plan.get("think"), self.plan.get("verify"), *(extra or []),
+                  f"「{topic}」の要点を整理しています", "見つかった情報を読み返しています",
+                  self.plan.get("write"), "回答の構成を練っています"]
+        return list(dict.fromkeys(l for l in labels if l))
 
     def set_plan(self, plan: dict) -> None:
         self.topic = str(plan.get("topic") or "")[:20]
@@ -206,7 +220,11 @@ class ThinkingView:
     def render(self) -> str:
         now = time.monotonic()
         p = PHASES[self.phase]
-        label = self.label or p.labels[int((now - self.phase_started) / LABEL_SECONDS) % len(p.labels)]
+        tick = int((now - self.phase_started) / LABEL_SECONDS)
+        if self.cycle:
+            label = self.cycle[tick % len(self.cycle)]
+        else:
+            label = self.label or p.labels[tick % len(p.labels)]
         spinner = SPINNER[self.frame % len(SPINNER)]
         dots = "." * (self.frame % 3 + 1)
         lines = [f"{spinner} {p.emoji} {label}{dots}"]

@@ -152,6 +152,8 @@ searcher = Searcher(
     sarashina, search_index, results=SEARCH_RESULTS,
     default_days=float(os.getenv("SEARCH_DEFAULT_DAYS", "365")),
     max_per_author=int(os.getenv("SEARCH_MAX_PER_AUTHOR", "2")),
+    min_rounds=int(os.getenv("SEARCH_MIN_ROUNDS", "2")),
+    max_rounds=int(os.getenv("SEARCH_MAX_ROUNDS", "6")),
 ) if search_index else None
 indexer: Indexer | None = None
 
@@ -242,6 +244,9 @@ async def on_ready() -> None:
             client, sarashina, search_index, SEARCH_CHANNEL_IDS, guild_ids,
             backfill_limit=int(os.getenv("SEARCH_BACKFILL_LIMIT", "5000")),
             backfill_days=float(os.getenv("SEARCH_BACKFILL_DAYS", "365")),
+            # Bot と会話するチャンネル自体は取り込まない (SEARCH_INDEX_BOT_CHANNELS=true で取り込む)
+            exclude_ids=set() if os.getenv("SEARCH_INDEX_BOT_CHANNELS", "false").lower() in ("1", "true", "yes")
+            else set(CHANNEL_IDS),
             interval=float(os.getenv("SEARCH_INDEX_INTERVAL", "120")),
         )
         indexer.start()
@@ -351,7 +356,7 @@ async def think(
     # 4. 残り時間は待機 (アニメーションは動き続ける)
     remaining = target - time.monotonic()
     if remaining > 0.3:
-        view.set_phase("wait")
+        view.set_phase("wait", cycle=view.thinking_labels())
         await asyncio.sleep(remaining)
     return slot
 
@@ -442,7 +447,7 @@ async def on_message(message: discord.Message) -> None:
             except Exception:
                 log.exception("思考の生成に失敗しました (思考なしで回答します)")
         if slot is None:
-            slot = await wait_for_mini(view, "回答の順番を待っています")
+            slot = await wait_for_mini(view)
     except BaseException:
         await animator.stop(final=False)
         raise
@@ -505,13 +510,17 @@ async def make_plan(view: ThinkingView, question: str) -> None:
         log.debug("作業計画の生成に失敗しました", exc_info=True)
 
 
-async def wait_for_mini(view: ThinkingView, label: str) -> float:
-    """mini の送信枠を予約し、空くまで待つ (待つ間はステータスに残り時間を出す)."""
-    slot = sarashina.limiter().reserve()
+async def wait_for_mini(view: ThinkingView, extra: list[str] | None = None, slot: float | None = None) -> float:
+    """mini の送信枠を予約し (予約済みならその時刻まで)、空くまで待つ.
+
+    待っている間も「考えている」ことが伝わるよう、質問に合わせた思考ラベルを切り替えて表示する
+    (残り時間は進捗バーの横に小さく出る)。
+    """
+    if slot is None:
+        slot = sarashina.limiter().reserve()
     if slot - time.monotonic() > 0.3:
         view.deadline = slot
-        view.set_phase("queue", label)
-        view.note(f"mini の利用が混み合っているため、約{slot - time.monotonic():.0f}秒お待ちください")
+        view.set_phase("wait", cycle=view.thinking_labels(extra))
         await asyncio.sleep(slot - time.monotonic())
         view.deadline = None
     return slot
@@ -539,7 +548,7 @@ async def check_and_revise(view: ThinkingView, messages: list[dict], draft: str)
         return draft
     log.info("回答を書き直します: %s", problems)
     view.note("見直しで直したい点が見つかったので書き直しています")
-    slot = await wait_for_mini(view, "書き直しの順番を待っています")
+    slot = await wait_for_mini(view, ["指摘された点を確かめています", "直し方を考えています"])
     view.set_phase("revise")
     revised = await sarashina.chat(
         [
@@ -574,7 +583,17 @@ async def handle_search(
     if not allowed:
         return "⚠️ 検索できるチャンネルがありません。"
     limit = SEARCH_RESULTS if req.type == "locate" else 6
-    hits = await searcher.search(req, allowed, message.guild.id, limit)
+    # まとめる場合は mini の回答枠を先に予約し、空くまでの時間も検索を続けて情報を厚くする
+    slot = sarashina.limiter().reserve() if req.type == "summarize" else None
+
+    async def progress(label: str, note: str | None = None) -> None:
+        view.set_phase("search", label)
+        if note:
+            view.note(note)
+
+    hits = await searcher.search(
+        req, allowed, message.guild.id, limit, question=question, progress=progress, deadline=slot,
+    )
     log.info("検索: %s → %d 件 (%s)", req, len(hits), req.type)
     if not hits:
         msgs, _ = search_index.stats()
@@ -585,7 +604,8 @@ async def handle_search(
     if req.type == "locate":
         return searcher.format_locate(req, hits)
 
-    slot = await wait_for_mini(view, "まとめの順番を待っています")
+    slot = await wait_for_mini(view, [f"見つかった{len(hits)}件の会話を読み比べています",
+                                      "話の流れを時系列に並べています"], slot=slot)
     view.set_phase("summarize", f"見つかった{len(hits)}件の会話をまとめています")
     return await searcher.summarize(req, hits, question, slot=slot)
 

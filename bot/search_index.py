@@ -197,6 +197,17 @@ class SearchIndex:
         self.chunk_times = np.append(self.chunk_times, row[1])
         self.matrix = np.vstack([self.matrix, embedding[None, :]])
 
+    def purge_channel(self, channel_id: int) -> int:
+        """チャンネルの発言・チャンクを索引から消す (スレッドは parent を問わず channel_id 単位)."""
+        n = self.db.execute("SELECT COUNT(*) FROM messages WHERE channel_id = ?", (channel_id,)).fetchone()[0]
+        self.db.execute("DELETE FROM messages WHERE channel_id = ?", (channel_id,))
+        self.db.execute("DELETE FROM chunks WHERE channel_id = ?", (channel_id,))
+        self.db.execute("DELETE FROM channel_state WHERE channel_id = ?", (channel_id,))
+        self.db.commit()
+        if n:
+            self._load_vectors()
+        return n
+
     def delete_message(self, message_id: int) -> None:
         self.db.execute("DELETE FROM messages WHERE id = ?", (message_id,))
         self.db.commit()
@@ -305,6 +316,19 @@ class SearchIndex:
         ).fetchall()
         return [r[0] for r in rows if r[0] is not None]
 
+    def adjacent_chunks(self, chunk_id: int) -> tuple[int | None, int | None]:
+        """同じチャンネルで直前・直後の会話 (チャンク)."""
+        row = self.db.execute("SELECT channel_id, start_at FROM chunks WHERE id = ?", (chunk_id,)).fetchone()
+        if not row:
+            return None, None
+        prev = self.db.execute(
+            "SELECT id FROM chunks WHERE channel_id = ? AND start_at < ? ORDER BY start_at DESC LIMIT 1", row
+        ).fetchone()
+        nxt = self.db.execute(
+            "SELECT id FROM chunks WHERE channel_id = ? AND start_at > ? ORDER BY start_at ASC LIMIT 1", row
+        ).fetchone()
+        return (prev[0] if prev else None), (nxt[0] if nxt else None)
+
     def find_channels(self, name: str, guild_ids: set[int]) -> set[int]:
         """チャンネル名の部分一致."""
         name = name.strip().lstrip("#").removesuffix("チャンネル").strip()
@@ -370,8 +394,11 @@ class Indexer:
         interval: float = 120.0,
         idle: timedelta = timedelta(minutes=3),
         headroom: int = 20,
+        exclude_ids: set[int] | None = None,
     ) -> None:
         self.client = client
+        # Bot と会話するチャンネルは取り込まない (Bot への依頼文が検索結果に混ざるため)
+        self.exclude_ids = exclude_ids or set()
         self.sarashina = sarashina
         self.index = index
         self.channel_ids = channel_ids  # None ならサーバー内の読める全テキストチャンネル
@@ -385,6 +412,10 @@ class Indexer:
         self._tasks: list[asyncio.Task] = []
 
     def start(self) -> None:
+        for channel_id in self.exclude_ids:
+            removed = self.index.purge_channel(channel_id)
+            if removed:
+                log.info("取り込み対象外のチャンネル %s の発言 %d 件を索引から削除しました", channel_id, removed)
         if not self._tasks:
             self._tasks = [
                 asyncio.create_task(self._crawl_loop()),
@@ -395,6 +426,8 @@ class Indexer:
     def is_indexed(self, channel) -> bool:
         guild = getattr(channel, "guild", None)
         if guild is None or guild.id not in self.guild_ids:
+            return False
+        if channel.id in self.exclude_ids or getattr(channel, "parent_id", None) in self.exclude_ids:
             return False
         if self.channel_ids is None:
             return True
