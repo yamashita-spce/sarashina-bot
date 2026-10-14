@@ -8,10 +8,12 @@ Discord の指定チャンネルの投稿に、国産LLM Sarashina (SB Intuition
 - `bot/sarashina.py` — aiohttp ベースの API クライアント `SarashinaClient`（`chat` / `chat_stream`, `model=` で呼び分け）と、予約制の `RateLimiter`（モデルごとに独立。`reserve()` が送信可能時刻を返し、`chat(slot=...)` でその時刻に送る）
 - `bot/context.py` — `ContextManager`。チャンネル/スレッドごとに「要約＋最終取り込みメッセージID＋直近の生発言」をメモリ保持し、質問時に新着分だけを nano で差分要約 → `build_context_block` でシステムプロンプトに付加。Bot のステータス行（スピナーで始まる）は除外
 - `bot/thinking.py` — 思考プロンプト（初回/見直し/回答設計）、`ThinkingView`（思考メモの保持と、段階 `PHASES`・スピナー・進捗バーのステータス描画）、`Animator`（バックグラウンドタスクで `STREAM_EDIT_INTERVAL` ごとにステータスを再描画）、`ThrottledEditor`
+- `bot/search.py` — `Searcher`。`route()`(nano で検索判定＋条件抽出, JSON mode) → `search()`(embedding ベクトル検索＋LIKE キーワード検索 → rerank → nano 関連判定で会話と中心発言を選ぶ。期間指定で0件なら期間なしで再検索) → `format_locate()`(リンク付き一覧) / `summarize()`(mini で要約、`[n]` を jump_url リンクに変換)。`allowed_channels()` で質問者が見えるチャンネルに限定
+- `bot/search_index.py` — `SearchIndex`(SQLite: messages/chunks/channel_state、チャンクのベクトルは 256 次元に切り詰め正規化し numpy 行列でメモリ保持) と `Indexer`(バックグラウンドで全テキストチャンネルの新着＋過去ログを200件ずつ索引付け。埋め込み API は `wait_for_headroom(20)` で検索用の枠を残す)
 - 設定はすべてルートの `.env`（`.env.example` 参照）
 
 ## on_message の流れ
-ステータス行で返信し Animator 開始 → 文脈要約(nano) →（`THINKING_ENABLED` 時のみ `think()`: 思考→見直し→mini 枠 `reserve()`→回答設計/待機）→ mini 枠を予約し埋まっていれば「⏳ 回答の順番を待っています」表示 → `sarashina.chat(slot=...)` で mini の回答を一括生成（この間ステータスは「✍️ 回答を書いています」）→ Animator 停止 → 回答を**新規メッセージ**で投稿 → ステータスのメッセージを削除
+ステータス行で返信し Animator 開始 → `searcher.route()` で検索判定（検索なら `handle_search` → 結果を新規投稿してステータス削除で終了）→ 文脈要約(nano) →（`THINKING_ENABLED` 時のみ `think()`: 思考→見直し→mini 枠 `reserve()`→回答設計/待機）→ mini 枠を予約し埋まっていれば「⏳ 回答の順番を待っています」表示 → `sarashina.chat(slot=...)` で mini の回答を一括生成（この間ステータスは「✍️ 回答を書いています」）→ Animator 停止 → 回答を**新規メッセージ**で投稿 → ステータスのメッセージを削除
 
 ## ユーザー要望・決定事項
 - 回答はストリーミングせず一気に出す。ステータス（思考ブロック）に上書きせず新規メッセージで投稿する
@@ -20,6 +22,12 @@ Discord の指定チャンネルの投稿に、国産LLM Sarashina (SB Intuition
 - mini の 6 RPM を思考で消費しない（mini 自身に思考させる inline 方式は廃止済み）
 - 思考フェーズは既定 off（A/B 検証で mini 単体 9/10 vs 思考あり 10/10 と差が小さく、ユーザー判断で一旦なし）。`THINKING_ENABLED=true` で復活
 - サーバーのログは `logs/bot.log`（TimedRotatingFileHandler, 日次, `LOG_RETENTION_DAYS` 日保持）。TTY が無い(systemd)時はコンソール出力しないので journal に溜まらない
+
+## 検索の設計判断
+- 埋め込みは発言単位ではなく会話チャンク単位（短い発言は意味が取りにくい・埋め込み 60 RPM で全履歴は重い）
+- rerank のスコアは無関係でも 0.9 超になることがあり、しきい値に使えない → nano で関連判定（実データで確認済み）
+- 実データは URL・画像・相づちが多く、発言単位の rerank ではリンク先選びが不正確 → nano に会話全体を読ませて中心の発言を選ばせる
+- `numpy` を使用（requirements.txt）
 
 ## Discord の罠
 - 連続編集すると最終編集（特に `embed=None` による削除）が後から元に戻ることがある → 回答は編集ではなく新規投稿＋ステータス削除で出す

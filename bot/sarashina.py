@@ -1,4 +1,4 @@
-"""Sarashina API の非同期クライアント (Chat Completions)."""
+"""Sarashina API の非同期クライアント (Chat Completions / Embeddings / Rerank)."""
 
 from __future__ import annotations
 
@@ -10,10 +10,19 @@ from collections.abc import AsyncIterator
 
 import aiohttp
 
-API_URL = "https://api.sarashina.ai/v1/chat/completions"
+BASE_URL = "https://api.sarashina.ai/v1"
+API_URL = f"{BASE_URL}/chat/completions"
+EMBED_MODEL = "sarashina3-embedding"
+RERANK_MODEL = "sarashina3-rerank"
 
 # 無償ベータのモデル別レート制限 (requests/min)
-DEFAULT_RPM = {"sarashina3-mini": 6, "sarashina3-nano": 60, "sarashina3-guard": 6}
+DEFAULT_RPM = {
+    "sarashina3-mini": 6,
+    "sarashina3-nano": 60,
+    "sarashina3-guard": 6,
+    EMBED_MODEL: 60,
+    RERANK_MODEL: 60,
+}
 
 
 class SarashinaError(Exception):
@@ -42,6 +51,16 @@ class RateLimiter:
         else:
             t = self._slots[-self.rpm] + 60
         return max(t, self._slots[-1]) if self._slots else t
+
+    def load(self) -> int:
+        """直近1分間 (予約済みを含む) の送信数."""
+        self._prune(time.monotonic())
+        return len(self._slots)
+
+    async def wait_for_headroom(self, headroom: int) -> None:
+        """空き枠が headroom 個より多くなるまで待つ (バックグラウンド処理用の低優先度待機)."""
+        while self.load() >= self.rpm - headroom:
+            await asyncio.sleep(1.0)
 
     def queue_wait(self) -> float:
         """今予約した場合の待ち秒数 (予約はしない)."""
@@ -107,6 +126,7 @@ class SarashinaClient:
         max_completion_tokens: int | None,
         temperature: float | None,
         stream: bool = False,
+        response_format: dict | None = None,
     ) -> dict:
         # 注意: Sarashina API は未定義フィールド (max_tokens, logprobs, stream_options 等) を 400 で拒否する
         payload = {
@@ -117,10 +137,12 @@ class SarashinaClient:
         }
         if stream:
             payload["stream"] = True
+        if response_format:
+            payload["response_format"] = response_format
         return payload
 
     async def _post(
-        self, payload: dict, retries: int, slot: float | None = None
+        self, payload: dict, retries: int, slot: float | None = None, url: str = API_URL
     ) -> aiohttp.ClientResponse:
         """レート制限を守って POST し、200 のレスポンスを返す (429/5xx はリトライ).
 
@@ -133,7 +155,7 @@ class SarashinaClient:
                 await wait_until(slot)
             else:
                 await limiter.acquire()
-            resp = await session.post(API_URL, json=payload)
+            resp = await session.post(url, json=payload)
             if resp.status == 200:
                 return resp
             text = await resp.text()
@@ -156,8 +178,12 @@ class SarashinaClient:
         temperature: float | None = None,
         retries: int = 2,
         slot: float | None = None,
+        response_format: dict | None = None,
     ) -> str:
-        payload = self._payload(messages, model or self.model, max_completion_tokens, temperature)
+        payload = self._payload(
+            messages, model or self.model, max_completion_tokens, temperature,
+            response_format=response_format,
+        )
         resp = await self._post(payload, retries, slot)
         async with resp:
             body = await resp.json()
@@ -192,3 +218,28 @@ class SarashinaClient:
                 delta = chunk["choices"][0].get("delta", {}).get("content")
                 if delta:
                     yield delta
+
+    async def embed(self, text: str, task_type: str, retries: int = 2) -> list[float]:
+        """テキストを埋め込みベクトル (1536次元) に変換する. 1リクエスト1テキストのみ."""
+        payload = {"model": EMBED_MODEL, "input": text, "task_type": task_type}
+        resp = await self._post(payload, retries, url=f"{BASE_URL}/embeddings")
+        async with resp:
+            body = await resp.json()
+        return body["data"][0]["embedding"]
+
+    async def rerank(
+        self, query: str, documents: list[str], task_type: str = "GENERAL_RETRIEVAL", retries: int = 2
+    ) -> list[tuple[int, float]]:
+        """documents (最大20件) を query との関連度順に並べ替え、(元の index, score) を返す."""
+        if not documents:
+            return []
+        payload = {
+            "model": RERANK_MODEL,
+            "query": query,
+            "documents": documents[:20],
+            "task_type": task_type,
+        }
+        resp = await self._post(payload, retries, url=f"{BASE_URL}/rerank")
+        async with resp:
+            body = await resp.json()
+        return [(r["document_id"], r["score"]) for r in body["data"][0]["result"]]

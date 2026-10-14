@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 
 from context import ContextManager
 from sarashina import SarashinaClient, SarashinaError
+from search import SearchRequest, Searcher
+from search_index import Indexer, SearchIndex
 from thinking import (
     PLAN_PROMPT,
     REVIEW_PROMPT,
@@ -81,6 +83,19 @@ sarashina = SarashinaClient(
     temperature=float(os.getenv("SARASHINA_TEMPERATURE", "0.7")),
     rpm=rpm_overrides,
 )
+# --- チャンネル横断検索 ---
+SEARCH_ENABLED = os.getenv("SEARCH_ENABLED", "true").lower() not in ("0", "false", "no")
+# 索引付けするチャンネル (空なら、対象チャンネルがあるサーバーの Bot が読める全テキストチャンネル)
+SEARCH_CHANNEL_IDS = {
+    int(c) for c in os.getenv("SEARCH_CHANNEL_IDS", "").replace(" ", "").split(",") if c
+} or None
+SEARCH_DB = os.getenv("SEARCH_DB", os.path.join(os.path.dirname(__file__), "..", "data", "search.db"))
+SEARCH_RESULTS = int(os.getenv("SEARCH_RESULTS", "5"))
+
+search_index = SearchIndex(SEARCH_DB) if SEARCH_ENABLED else None
+searcher = Searcher(sarashina, search_index, results=SEARCH_RESULTS) if search_index else None
+indexer: Indexer | None = None
+
 contexts = ContextManager(
     sarashina,
     model=CONTEXT_MODEL,
@@ -162,6 +177,29 @@ async def on_ready() -> None:
         log.warning("DISCORD_CHANNEL_IDS が空のため、どのチャンネルにも反応しません")
     if not THINKING_KEEP:
         await cleanup_leftover_thinking()
+    global indexer
+    if search_index and indexer is None:
+        guild_ids = {ch.guild.id for cid in CHANNEL_IDS if (ch := client.get_channel(cid)) and getattr(ch, "guild", None)}
+        indexer = Indexer(
+            client, sarashina, search_index, SEARCH_CHANNEL_IDS, guild_ids,
+            backfill_limit=int(os.getenv("SEARCH_BACKFILL_LIMIT", "5000")),
+            interval=float(os.getenv("SEARCH_INDEX_INTERVAL", "120")),
+        )
+        indexer.start()
+        msgs, chunks = search_index.stats()
+        log.info("検索インデックスを開始しました (発言 %d 件 / チャンク %d 件)", msgs, chunks)
+
+
+@client.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
+    if search_index:
+        search_index.delete_message(payload.message_id)
+
+
+@client.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
+    if search_index and "content" in payload.data:
+        search_index.update_message(payload.message_id, payload.data["content"])
 
 
 async def cleanup_leftover_thinking(limit: int = 100) -> None:
@@ -272,6 +310,25 @@ async def on_message(message: discord.Message) -> None:
     animator = Animator(view, status)
     animator.start()
 
+    # 0. 過去の会話の検索かどうかを振り分け
+    request = None
+    if searcher:
+        try:
+            names = [c.name for c in message.guild.text_channels] if message.guild else []
+            request = await searcher.route(question, names)
+        except Exception:
+            log.exception("振り分けに失敗しました (通常の質問として扱います)")
+    if request:
+        try:
+            answer = await handle_search(message, request, question, view)
+        except Exception:
+            log.exception("検索に失敗しました")
+            answer = "⚠️ 検索中にエラーが発生しました。"
+        finally:
+            await animator.stop(final=False)
+        await post_answer(message, status_msg, answer)
+        return
+
     try:
         # 1. チャンネルの背景コンテキスト (要約)
         context_block = ""
@@ -330,14 +387,46 @@ async def on_message(message: discord.Message) -> None:
     finally:
         await animator.stop(final=False)
 
-    # 回答を新しいメッセージとして投稿してから、ステータスのメッセージを消す
+    await post_answer(message, status_msg, answer)
+
+
+async def post_answer(message: discord.Message, status_msg: discord.Message, answer: str) -> None:
+    """回答を新しいメッセージとして投稿してから、ステータスのメッセージを消す."""
     reply = message
     for chunk in split_message(answer):
-        reply = await reply.reply(chunk, mention_author=False)
+        reply = await reply.reply(chunk, mention_author=False, suppress_embeds=True)
     try:
         await status_msg.delete()
     except discord.HTTPException as e:
         log.warning("ステータスメッセージの削除に失敗しました: %s", e)
+
+
+async def handle_search(
+    message: discord.Message, req: SearchRequest, question: str, view: ThinkingView
+) -> str:
+    """過去の会話を検索し、リンク付きの結果 (locate) かまとめ (summarize) を返す."""
+    view.set_phase("search")
+    allowed = searcher.allowed_channels(message.author, message.guild)
+    if not allowed:
+        return "⚠️ 検索できるチャンネルがありません。"
+    limit = SEARCH_RESULTS if req.type == "locate" else 6
+    hits = await searcher.search(req, allowed, message.guild.id, limit)
+    log.info("検索: %s → %d 件 (%s)", req, len(hits), req.type)
+    if not hits:
+        msgs, _ = search_index.stats()
+        note = "" if msgs else "\n-# まだ過去ログの索引付けが済んでいません。しばらくしてからお試しください。"
+        return f"🔍 「{searcher._label(req)}」に関する発言は見つかりませんでした。{note}"
+    if req.type == "locate":
+        return searcher.format_locate(req, hits)
+
+    wait = sarashina.limiter().queue_wait()
+    if wait > 1:
+        view.deadline = time.monotonic() + wait
+        view.set_phase("queue")
+        await asyncio.sleep(wait)
+        view.deadline = None
+    view.set_phase("summarize")
+    return await searcher.summarize(req, hits, question)
 
 
 def setup_logging() -> None:
