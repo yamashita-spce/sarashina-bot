@@ -15,7 +15,12 @@ Discord の指定チャンネルの投稿に、国産LLM Sarashina (SB Intuition
 ## on_message の流れ
 ステータス行で返信し Animator 開始 → `searcher.route()` で検索判定（検索なら `handle_search` → 結果を新規投稿してステータス削除で終了）→ 文脈要約(nano) →（`THINKING_ENABLED` 時のみ `think()`: 思考→見直し→mini 枠 `reserve()`→回答設計/待機）→ mini 枠を予約し埋まっていれば「⏳ 回答の順番を待っています」表示 → `sarashina.chat(slot=...)` で mini の回答を一括生成（この間ステータスは「✍️ 回答を書いています」）→ Animator 停止 → 回答を**新規メッセージ**で投稿 → ステータスのメッセージを削除
 
-## ユーザー要望・決定事項
+## ユーザー要望・決定事項（最新）
+- **速さより回答の質を優先**（レート制限を考慮しつつ遅くなってもよい）→ 思考 on、`check_and_revise`（nano が「まず自分で解いて比較」→重大な問題だけ mini が1回書き直す）
+- **thinking の UX はパーソナライズ**: `make_plan`（nano, `PLAN_LABELS_PROMPT`）で質問ごとに4段階（gather/think/verify/write）の具体的ラベルを作り、`ThinkingView` が質問者名・topic・段階の進み具合・見つかった会話のメモ（`note()`）と一緒に表示。フェーズ→段階の対応は `PHASE_STAGE`
+- mini の枠待ちは `wait_for_mini()` に集約（予約→残り時間表示→待機）
+
+## ユーザー要望・決定事項（以前）
 - 回答はストリーミングせず一気に出す。ステータス（思考ブロック）に上書きせず新規メッセージで投稿する
 - Discord には思考の中身を出さず、ステータス（スピナー＋見出し＋進捗バー）だけ表示。Embed は使わない
 - 回答後チャンネルには回答だけを残す（ログを重くしない）

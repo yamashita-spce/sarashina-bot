@@ -525,7 +525,9 @@ class Searcher:
             )
         return "\n".join(lines)
 
-    async def summarize(self, req: SearchRequest, hits: list[Hit], user_text: str) -> str:
+    async def summarize(
+        self, req: SearchRequest, hits: list[Hit], user_text: str, slot: float | None = None
+    ) -> str:
         """見つかった会話を mini でまとめ、[番号] を発言へのリンクに置き換える."""
         hits = sorted(hits, key=lambda h: h.messages[0].created_at)
         numbered: list[StoredMessage] = []
@@ -544,6 +546,7 @@ class Searcher:
                 {"role": "user", "content": f"# 依頼\n{user_text}\n\n# 検索条件\n{self._label(req)}\n\n# 見つかった会話\n{context}"},
             ],
             temperature=0.3,
+            slot=slot,
         )
 
         def link(match: re.Match) -> str:

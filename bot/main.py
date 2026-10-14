@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -18,6 +19,7 @@ from sarashina import SarashinaClient, SarashinaError
 from search import SearchRequest, Searcher
 from search_index import Indexer, SearchIndex
 from thinking import (
+    PLAN_LABELS_PROMPT,
     PLAN_PROMPT,
     REVIEW_PROMPT,
     SPINNER,
@@ -91,8 +93,23 @@ MODEL = os.getenv("SARASHINA_MODEL", "sarashina3-mini")
 CONTEXT_ENABLED = os.getenv("CONTEXT_ENABLED", "true").lower() not in ("0", "false", "no")
 CONTEXT_MODEL = os.getenv("CONTEXT_MODEL", "sarashina3-nano")
 # 思考は nano (60 RPM) が担当し、mini (6 RPM) は最終回答の1回だけに使う
-# 既定は off (A/B 検証で mini 単体との差が小さく、遅延と nano 呼び出しのコストに見合わなかったため)
-THINKING_ENABLED = os.getenv("THINKING_ENABLED", "false").lower() in ("1", "true", "yes")
+# 速さより回答の質を優先する方針のため既定は on (nano が多段階で考え、その思考メモを mini に渡す)
+THINKING_ENABLED = os.getenv("THINKING_ENABLED", "true").lower() not in ("0", "false", "no")
+# mini の回答案を nano がチェックし、重大な問題があれば mini が1回だけ書き直す
+ANSWER_CHECK_ENABLED = os.getenv("ANSWER_CHECK_ENABLED", "true").lower() not in ("0", "false", "no")
+ANSWER_CHECK_PROMPT = """あなたは回答のチェック係です。ユーザーの質問・直前の会話・AI の回答案が与えられます。
+手順:
+1. まず回答案を見ずに、質問に対する正しい答えの要点を自分で考える (計算や推論は途中式を書いて実際に解く)
+2. 自分の答えと回答案を比べ、次の重大な問題があるか判定する
+   - 質問に正面から答えていない、または質問の意図を取り違えている
+   - 事実・計算・論理の誤り (自分の答えと結論が食い違う)
+   - 直前の会話の取り違え (「それ」「こういうところ」などの対象を間違えている等)
+   - 根拠のない最新情報 (天気・ニュース等) を断定している
+細かい言い回し・文体・好みの問題は指摘しない。
+JSON だけを返す: {"own_answer": "自分で考えた答えの要点 (途中式を含む)", "verdict": "ok" または "revise", "problems": ["具体的な問題と直し方", ...]}"""
+REVISE_INSTRUCTION = """(チェック係から次の指摘がありました。指摘が正しい点だけを直して、回答全体を書き直してください。
+指摘が誤っている場合は元の回答をそのまま出力してください。前置きや「修正しました」等の説明は書かず、回答本文だけを出力すること)
+{problems}"""
 THINKING_MODEL = os.getenv("THINKING_MODEL", "sarashina3-nano")
 # 思考表示の最短時間 (秒). アニメーションを見せる時間も思考に充てる
 THINKING_MIN_SECONDS = float(os.getenv("THINKING_MIN_SECONDS", "4"))
@@ -349,7 +366,8 @@ async def on_message(message: discord.Message) -> None:
     if not question:
         return
 
-    view = ThinkingView()
+    view = ThinkingView(asker=message.author.display_name)
+    view.set_phase("context", f"{message.author.display_name}さんの質問を読んでいます")
     status_msg = await message.reply(view.render(), mention_author=False)
     status = ThrottledEditor(status_msg, STREAM_EDIT_INTERVAL)
     animator = Animator(view, status)
@@ -378,6 +396,9 @@ async def on_message(message: discord.Message) -> None:
         await post_answer(message, status_msg, answer)
         return
 
+    # 質問に合わせた作業計画 (進捗表示のラベル) を裏で立てる
+    plan_task = asyncio.create_task(make_plan(view, question))
+
     try:
         # 1. チャンネルの背景コンテキスト (要約)
         context_block = ""
@@ -398,6 +419,7 @@ async def on_message(message: discord.Message) -> None:
         knowledge = []
         if searcher and RAG_ENABLED:
             try:
+                await asyncio.wait({plan_task}, timeout=3)  # 計画のラベルが間に合えば使う
                 view.set_phase("search")
                 allowed = searcher.allowed_channels(message.author, message.guild)
                 if allowed:
@@ -407,6 +429,8 @@ async def on_message(message: discord.Message) -> None:
                     )
                     if knowledge:
                         log.info("RAG: %d 件の過去の会話を参考にします", len(knowledge))
+                        channels = "・".join(dict.fromkeys(f"#{h.messages[0].channel_name}" for h in knowledge))
+                        view.note(f"{channels} の過去の会話を{len(knowledge)}件見つけました")
             except Exception:
                 log.exception("関連する過去の会話の検索に失敗しました")
 
@@ -418,11 +442,7 @@ async def on_message(message: discord.Message) -> None:
             except Exception:
                 log.exception("思考の生成に失敗しました (思考なしで回答します)")
         if slot is None:
-            slot = sarashina.limiter().reserve()
-            if slot - time.monotonic() > 0.3:
-                view.deadline = slot
-                view.set_phase("wait" if THINKING_ENABLED else "queue")
-                await asyncio.sleep(slot - time.monotonic())
+            slot = await wait_for_mini(view, "回答の順番を待っています")
     except BaseException:
         await animator.stop(final=False)
         raise
@@ -451,6 +471,8 @@ async def on_message(message: discord.Message) -> None:
 
     try:
         answer = await sarashina.chat(messages, slot=slot)
+        if ANSWER_CHECK_ENABLED:
+            answer = await check_and_revise(view, messages, answer)
     except SarashinaError as e:
         log.error("Sarashina API エラー: %s", e)
         answer = f"⚠️ Sarashina API でエラーが発生しました: `{truncate(str(e), 300)}`"
@@ -464,9 +486,70 @@ async def on_message(message: discord.Message) -> None:
         if THINKING_KEEP and THINKING_ENABLED:
             answer = f"{view.header}\n{answer}"
     finally:
+        plan_task.cancel()
         await animator.stop(final=False)
 
     await post_answer(message, status_msg, answer)
+
+
+async def make_plan(view: ThinkingView, question: str) -> None:
+    """nano に、この質問に合わせた作業ラベル (集める/考える/確かめる/書く) を作らせる."""
+    try:
+        raw = await sarashina.chat(
+            [{"role": "system", "content": PLAN_LABELS_PROMPT}, {"role": "user", "content": question}],
+            model=THINKING_MODEL, max_completion_tokens=300, temperature=0.3,
+            response_format={"type": "json_object"},
+        )
+        view.set_plan(json.loads(raw))
+    except Exception:
+        log.debug("作業計画の生成に失敗しました", exc_info=True)
+
+
+async def wait_for_mini(view: ThinkingView, label: str) -> float:
+    """mini の送信枠を予約し、空くまで待つ (待つ間はステータスに残り時間を出す)."""
+    slot = sarashina.limiter().reserve()
+    if slot - time.monotonic() > 0.3:
+        view.deadline = slot
+        view.set_phase("queue", label)
+        view.note(f"mini の利用が混み合っているため、約{slot - time.monotonic():.0f}秒お待ちください")
+        await asyncio.sleep(slot - time.monotonic())
+        view.deadline = None
+    return slot
+
+
+async def check_and_revise(view: ThinkingView, messages: list[dict], draft: str) -> str:
+    """回答案を nano でチェックし、重大な問題があれば mini で1回だけ書き直す."""
+    view.set_phase("check")
+    context = "\n".join(f"{m['role']}: {m['content'][:400]}" for m in messages[1:][-5:])
+    try:
+        raw = await sarashina.chat(
+            [
+                {"role": "system", "content": ANSWER_CHECK_PROMPT},
+                {"role": "user", "content": f"# 質問と直前の会話\n{context}\n\n# 回答案\n{draft}"},
+            ],
+            model=THINKING_MODEL, max_completion_tokens=800, temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        result = json.loads(raw)
+    except Exception:
+        log.warning("回答のチェックに失敗しました (回答案をそのまま使います)", exc_info=True)
+        return draft
+    problems = [p for p in result.get("problems") or [] if isinstance(p, str) and p.strip()]
+    if result.get("verdict") != "revise" or not problems:
+        return draft
+    log.info("回答を書き直します: %s", problems)
+    view.note("見直しで直したい点が見つかったので書き直しています")
+    slot = await wait_for_mini(view, "書き直しの順番を待っています")
+    view.set_phase("revise")
+    revised = await sarashina.chat(
+        [
+            *messages,
+            {"role": "assistant", "content": draft},
+            {"role": "user", "content": REVISE_INSTRUCTION.format(problems="\n".join(f"- {p}" for p in problems))},
+        ],
+        slot=slot,
+    )
+    return revised.strip() or draft
 
 
 async def post_answer(message: discord.Message, status_msg: discord.Message, answer: str) -> None:
@@ -484,7 +567,9 @@ async def handle_search(
     message: discord.Message, req: SearchRequest, question: str, view: ThinkingView
 ) -> str:
     """過去の会話を検索し、リンク付きの結果 (locate) かまとめ (summarize) を返す."""
-    view.set_phase("search")
+    where = f"#{req.channel}" if req.channel else "サーバー全体"
+    view.topic = searcher._label(req)[:20]
+    view.set_phase("search", f"{where}から「{searcher._label(req)[:16]}」を探しています")
     allowed = searcher.allowed_channels(message.author, message.guild)
     if not allowed:
         return "⚠️ 検索できるチャンネルがありません。"
@@ -495,17 +580,14 @@ async def handle_search(
         msgs, _ = search_index.stats()
         note = "" if msgs else "\n-# まだ過去ログの索引付けが済んでいません。しばらくしてからお試しください。"
         return f"🔍 「{searcher._label(req)}」に関する発言は見つかりませんでした。{note}"
+    channels = "・".join(dict.fromkeys(f"#{h.messages[0].channel_name}" for h in hits))
+    view.note(f"{channels} で{len(hits)}件の会話が見つかりました")
     if req.type == "locate":
         return searcher.format_locate(req, hits)
 
-    wait = sarashina.limiter().queue_wait()
-    if wait > 1:
-        view.deadline = time.monotonic() + wait
-        view.set_phase("queue")
-        await asyncio.sleep(wait)
-        view.deadline = None
-    view.set_phase("summarize")
-    return await searcher.summarize(req, hits, question)
+    slot = await wait_for_mini(view, "まとめの順番を待っています")
+    view.set_phase("summarize", f"見つかった{len(hits)}件の会話をまとめています")
+    return await searcher.summarize(req, hits, question, slot=slot)
 
 
 def setup_logging() -> None:

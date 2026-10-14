@@ -79,6 +79,13 @@ PHASES = {
         "会話をまとめています",
         "要点を整理しています",
     )),
+    "check": Phase("🔎", (
+        "回答を見直しています",
+        "質問に答えられているか確かめています",
+    )),
+    "revise": Phase("🛠️", (
+        "指摘を反映して書き直しています",
+    )),
     "queue": Phase("⏳", (
         "回答の順番を待っています",
         "混雑中のため少々お待ちください",
@@ -99,24 +106,65 @@ def truncate(text: str, limit: int, tail: bool = False) -> str:
     return "…" + text[-(limit - 1):] if tail else text[: limit - 1] + "…"
 
 
+# 質問ごとに作業計画 (各段階のラベル) を立てるためのプロンプト (nano, JSON)
+PLAN_LABELS_PROMPT = """あなたは AI アシスタントの進捗表示の担当です。ユーザーの質問に答えるまでの作業を、
+次の4段階それぞれについて、この質問の中身に合わせた具体的なラベルにしてください。
+- gather: 関係する情報・過去の会話を集める段階
+- think: 考える・分析する段階
+- verify: 検算・事実確認などで確かめる段階
+- write: 回答を書く段階
+各ラベルは「〜しています」で終わる20字以内の日本語。質問のキーワードを入れ、何をしているかが具体的に分かるように。
+topic には質問の要点を12字以内で書く。
+例: 質問「来週の勉強会って何時から？」→ {"topic": "勉強会の開始時刻", "gather": "勉強会の日程の発言を探しています", "think": "決まった日時を整理しています", "verify": "変更がなかったか確かめています", "write": "開始時刻をまとめています"}
+JSON だけを返すこと: {"topic": "...", "gather": "...", "think": "...", "verify": "...", "write": "..."}"""
+
+# 進捗の1行で使う段階の短い名前 (表示順)
+STAGES = (("gather", "集める"), ("think", "考える"), ("verify", "確かめる"), ("write", "書く"))
+# 各フェーズがどの段階に当たるか
+PHASE_STAGE = {
+    "context": "gather", "search": "gather", "think": "think", "review": "verify", "plan": "verify",
+    "wait": "verify", "queue": "write", "answer": "write", "check": "write", "revise": "write",
+    "summarize": "write",
+}
+
+
 class ThinkingView:
-    """思考中ステータス (1行) の状態と描画.
+    """処理中ステータスの状態と描画.
 
     思考の中身はバックエンドで回答モデルに渡すだけで、Discord には表示しない。
+    代わりに「この質問に合わせた作業ラベル」「誰への回答か」「何が見つかったか」を表示する。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, asker: str = "") -> None:
         self.started = time.monotonic()
+        self.asker = asker
         self.phase = "context"
         self.phase_started = self.started
+        self.label: str | None = None  # このフェーズの、質問に合わせたラベル (無ければ汎用ラベル)
+        self.plan: dict[str, str] = {}  # 段階ごとの、質問に合わせたラベル
+        self.topic = ""
+        self.notes: list[str] = []  # 見つかったもの・状況のメモ (最新2件を表示)
+        self.show_stages = False
         self.sections: list[tuple[str, str]] = []  # (見出し, 本文) — 回答モデルに渡す思考メモ
-        self.deadline: float | None = None  # 思考を終える予定時刻 (進捗バー用)
+        self.deadline: float | None = None  # 終了予定時刻 (進捗バー用)
         self.frame = 0
         self.thinking_seconds: float | None = None
 
-    def set_phase(self, key: str) -> None:
+    def set_phase(self, key: str, label: str | None = None) -> None:
+        """フェーズを切り替える. label を省略すると、作業計画のラベル → 汎用ラベルの順に使う."""
         self.phase = key
         self.phase_started = time.monotonic()
+        self.label = label or self.plan.get(PHASE_STAGE.get(key, ""))
+
+    def set_plan(self, plan: dict) -> None:
+        self.topic = str(plan.get("topic") or "")[:20]
+        self.plan = {k: str(plan[k])[:30] for k, _ in STAGES if isinstance(plan.get(k), str) and plan[k].strip()}
+        self.show_stages = bool(self.plan)
+        if not self.label:
+            self.label = self.plan.get(PHASE_STAGE.get(self.phase, ""))
+
+    def note(self, text: str) -> None:
+        self.notes.append(text)
 
     def add_section(self, title: str, body: str) -> None:
         self.sections.append((title, body.strip()))
@@ -145,16 +193,31 @@ class ThinkingView:
         pos = self.frame % (BAR_CELLS + 3)
         return "".join("▰" if pos - 3 < i <= pos else "▱" for i in range(BAR_CELLS))
 
+    def _stages(self, spinner: str) -> str:
+        current = PHASE_STAGE.get(self.phase, "gather")
+        keys = [k for k, _ in STAGES]
+        idx = keys.index(current)
+        parts = []
+        for i, (k, name) in enumerate(STAGES):
+            mark = "✅" if i < idx else (spinner if i == idx else "▫️")
+            parts.append(f"{mark} {name}")
+        return " → ".join(parts)
+
     def render(self) -> str:
         now = time.monotonic()
         p = PHASES[self.phase]
-        label = p.labels[int((now - self.phase_started) / LABEL_SECONDS) % len(p.labels)]
+        label = self.label or p.labels[int((now - self.phase_started) / LABEL_SECONDS) % len(p.labels)]
         spinner = SPINNER[self.frame % len(SPINNER)]
         dots = "." * (self.frame % 3 + 1)
-        remain = ""
-        if self.deadline and self.deadline - now >= 1:
-            remain = f"  あと約{self.deadline - now:.0f}秒"
-        return f"{spinner} {p.emoji} {label}{dots}\n-# `{self._bar(now)}` {now - self.started:.0f}秒{remain}"
+        lines = [f"{spinner} {p.emoji} {label}{dots}"]
+        who = f"{self.asker}さんの「{self.topic}」" if self.asker and self.topic else (
+            f"{self.asker}さんへの回答" if self.asker else "")
+        if self.show_stages:
+            lines.append(f"-# {self._stages(spinner)}")
+        remain = f" · あと約{self.deadline - now:.0f}秒" if self.deadline and self.deadline - now >= 1 else ""
+        lines.append(f"-# `{self._bar(now)}` {now - self.started:.0f}秒{remain}" + (f" · {who}" if who else ""))
+        lines += [f"-# 📎 {n}" for n in self.notes[-2:]]
+        return "\n".join(lines)
 
 
 class ThrottledEditor:
