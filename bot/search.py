@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 import discord
 
 from sarashina import SarashinaClient
+from output_check import CITATION_RUN, clean_model_output, verify_citations
 from search_index import SearchIndex, StoredMessage, keyword_pattern, normalize
 
 log = logging.getLogger("sarashina-bot.search")
@@ -160,24 +161,33 @@ RECENCY_WEIGHT = 0.4
 def cite(answer: str, messages: list[StoredMessage], title: str, prefix: str = "", max_refs: int = 6) -> str:
     """回答中の [番号] を出てきた順の通し番号に振り直し、引用された発言をリンク付きで末尾に小さく添える.
 
-    本文は「求められている答え」(番号は短く)、末尾は「参考にした部分」という形にそろえる。
+    - 同じ発言は1つの番号にまとめる (別番号で重複して載らないように)
+    - 参考一覧に載せきれない番号 (max_refs 超) は本文からも外す (リンク先の無い番号を残さない)
+    - 本文は「求められている答え」(番号は短く)、末尾は「参考にした部分」という形にそろえる
     """
-    used: list[int] = []
+    order: list[int] = []  # 出てきた順の発言 ID
 
     def link(match: re.Match) -> str:
         n = int(match.group(1))
-        if 1 <= n <= len(messages):
-            if n not in used:
-                used.append(n)
-            return f"[{prefix}{used.index(n) + 1}]"  # 本文は短い番号だけ (リンクは末尾の一覧に)
-        return ""
+        if not 1 <= n <= len(messages):
+            return ""
+        mid = messages[n - 1].id
+        if mid not in order:
+            order.append(mid)
+        k = order.index(mid) + 1
+        return f"[{prefix}{k}]" if k <= max_refs else ""
 
-    answer = re.sub(rf"\[{prefix}(\d{{1,3}})\](?!\()", link, answer).strip()
-    if not used:
+    answer = re.sub(rf"\[{prefix}(\d{{1,3}})\](?!\()", link, answer)
+    # 同じ番号が続いたら1つに、4つ以上続いたら3つまでに
+    answer = re.sub(rf"(\[{prefix}\d{{1,3}}\])(\s*\1)+", r"\1", answer)
+    answer = CITATION_RUN.sub(r"\1", answer)
+    answer = re.sub(r"[ \t]+([。、！？」])", r"\1", answer).strip()
+    if not order:
         return answer
+    by_id = {m.id: m for m in messages}
     refs = []
-    for k, n in enumerate(used[:max_refs], 1):
-        m = messages[n - 1]
+    for k, mid in enumerate(order[:max_refs], 1):
+        m = by_id[mid]
         snippet = re.sub(r"\s+", " ", m.content)
         snippet = snippet[:40] + "…" if len(snippet) > 40 else snippet
         refs.append(f"-# [{prefix}{k}] <#{m.channel_id}> {m.when} {m.author_name}「{snippet}」[→ 移動]({m.jump_url})")
@@ -756,7 +766,7 @@ class Searcher:
     def link_knowledge(answer: str, hits: list[Hit]) -> str:
         """回答中の [参N] を発言へのリンクにし、参考にした過去の会話を末尾に添える."""
         msgs = [h.best or h.messages[0] for h in hits]
-        return cite(answer, msgs, "参考にした過去の会話", prefix="参")
+        return cite(clean_model_output(answer, keep_markers=True), msgs, "参考にした過去の会話", prefix="参")
 
     async def _filter_relevant(
         self, req: SearchRequest, hits: list[Hit], prompt: str = RELEVANCE_PROMPT,
@@ -872,6 +882,8 @@ class Searcher:
             max_completion_tokens=budget.max_tokens,
             slot=slot,
         )
+        # 捏造されうるリンク・参考一覧や暴走した繰り返しを取り除く
+        drafts = [clean_model_output(d, keep_markers=True) for d in drafts]
         # 根拠が無いと書いてきた案は除く (1文目は「依頼への答え」と決めているので、1文目で判定)
         usable = []
         for d in drafts:
@@ -881,9 +893,12 @@ class Searcher:
                 usable.append(d)
         if not usable:
             return ComposeResult("")
+        sources = [f"{m.author_name}: {m.content}" for m in numbered]
+        max_refs = {"all": 15, "several": 10}.get(req.breadth, 6)
         if len(usable) == 1:
-            return ComposeResult(cite(usable[0], numbered, "参考にした発言",
-                                      max_refs={"all": 15, "several": 10}.get(req.breadth, 6)))
+            await report("引用が本文を裏付けているか確かめています")
+            checked = await verify_citations(self.sarashina, self.router_model, usable[0], sources)
+            return ComposeResult(cite(checked, numbered, "参考にした発言", max_refs=max_refs))
 
         await report(f"{len(usable)}通りの回答案を書いて、どれが質問に一番答えているか比べています")
         labels = "ABCDE"
@@ -921,9 +936,11 @@ class Searcher:
         log.info("回答案 %d 通りから %s を選択 / 回答度 %s / 食い違い %s / 審査員の推し %s / 欠け: %s",
                  len(usable), labels[idx], {labels[i]: round(v, 1) for i, v in enumerate(scores)},
                  sorted(contradicts), best, judged.get("missing"))
-        max_refs = {"all": 15, "several": 10}.get(req.breadth, 6)
+        # 最終出力の再検査: 各文の引用が本当にその文を裏付けているかを確かめ、裏付けの無い番号を外す
+        await report("引用が本文を裏付けているか確かめています")
+        checked = await verify_citations(self.sarashina, self.router_model, usable[idx], sources)
         return ComposeResult(
-            cite(usable[idx], numbered, "参考にした発言", max_refs=max_refs),
+            cite(checked, numbered, "参考にした発言", max_refs=max_refs),
             missing=str(judged.get("missing") or "").strip(),
             search=str(judged.get("search") or "").strip(),
         )
@@ -936,7 +953,7 @@ class Searcher:
             f"- #{h.messages[0].channel_name} {h.messages[0].when}: {self._chunk_text(h.messages)[:120]}"
             for h in hits[:3]
         ) or "(なし)"
-        return await self.sarashina.chat(
+        text = await self.sarashina.chat(
             [
                 {"role": "system", "content": CLARIFY_PROMPT},
                 {"role": "user", "content": f"# 依頼\n{user_text}\n\n# 近い話題として見つかった会話\n{near}"},
@@ -944,6 +961,7 @@ class Searcher:
             temperature=0.3,
             slot=slot,
         )
+        return clean_model_output(text, keep_markers=False)
 
     @staticmethod
     def _label(req: SearchRequest) -> str:

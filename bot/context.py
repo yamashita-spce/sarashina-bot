@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 import discord
 
+from output_check import strip_references
 from sarashina import SarashinaClient
 from thinking import SPINNER
 
@@ -134,6 +135,10 @@ class ContextManager:
             if m.author.id == self.bot_user_id:
                 if not text or text[:1] in SPINNER:
                     continue  # 処理中ステータスは除外
+                # 過去の回答の参考一覧・引用番号は渡さない (真似して存在しないリンクを捏造したため)
+                text = strip_references(text)
+                if not text:
+                    continue
                 role, content = "assistant", text
             else:
                 line = self.format_message(m)

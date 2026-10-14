@@ -26,6 +26,7 @@ Discord の指定チャンネルの投稿に、国産LLM Sarashina (SB Intuition
 - **回答度** = `SarashinaClient.answer_scores`: rerank `GENERAL_QA` のスコアを logit にしたもの。生スコアは 0.9999 に張り付くので logit 必須。「質問への答えになっているか」は測れる（答えている 13〜21 / 一部 10〜14 / 答えていない 2〜5）が、事実の正誤は測れない。ユーザー方針「正確さより質問への回答になっているかを見る」。普通の質問でも `check_and_revise` で回答度 < `ANSWER_MIN_SCORE`(7) なら書き直し
 - **質問の背景は必ず Discord の会話**（ユーザー要望・最重要）: 既定のシステムプロンプト冒頭に明記。検索の回答 (`Searcher.compose(background=...)`) にもチャンネルの直前の会話を渡す。RAG の `KNOWLEDGE_PROMPT` も「サーバー内で話題なら積極的に選ぶ」
 - **「詳しく」「複数」「全て」「N件」で収集量を増やす**（ユーザー要望）: `read_scope()`（nano の detail/breadth/count ＋手がかり語、多い方）→ `SearchRequest.budget`（`Budget.for_request`: 使う会話数・往復数・候補保持数・関連判定数・文脈文字数・回答トークン・1人あたり上限・書き方）。普通の質問でも RAG 件数と回答トークンに反映
+- **最終出力の再検査**（ユーザー指摘: 参照リンクのバグ）: `bot/output_check.py`。会話履歴の過去回答は `strip_references`、モデル生出力は `clean_model_output`（モデルが書いた参考一覧・Discord リンクは捏造なので必ず除去、引用番号の連続は3つまで、繰り返し暴走の除去）、検索回答は `verify_citations`（nano が文ごとに裏付けを判定）→ `cite()`（発言 ID で重複統合、一覧に無い番号は本文からも除去）。参考一覧・リンクはシステムだけが付ける
 - **検索中の表示は一言コメントを10秒に1回まで**（ユーザー要望:「1回目:」のような表示はダサい）: `ThinkingView.comment()` が `COMMENT_SECONDS` で間引く。待機中の思考ラベルも10秒ごと
 - Bot と会話するチャンネルは索引しない（`Indexer.exclude_ids`、起動時に `purge_channel`）。依頼文が検索結果・次の検索語を汚染したため
 

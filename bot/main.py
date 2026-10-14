@@ -15,6 +15,7 @@ import discord
 from dotenv import load_dotenv
 
 from context import ContextManager
+from output_check import clean_model_output
 from sarashina import SarashinaClient, SarashinaError
 from search import ComposeResult, SearchRequest, Searcher, read_scope
 from search_index import Indexer, SearchIndex
@@ -62,6 +63,8 @@ DEFAULT_SYSTEM_PROMPT = """あなたは「Sarashina」(SB Intuitions 開発の�
 - 「ご指摘ありがとうございます」「真摯に受け止め」「寄り添う」のような前置き・お礼・謝罪・共感の決まり文句は書かない
 - 普通の「です・ます」調で書く。過剰な敬語や、抽象的・大げさな言い回しは使わない
 - 質問と関係のない過去の話題を持ち出さない
+- 「草」「w」「なるほど」「ありがとう」のような短い相づち・感想には、分析や解説をせず、一言で自然に返す
+- 引用番号 ([1] など) や参考一覧、Discord のリンクは自分で書かない (必要な場合はシステムが付ける)
 - 分からないこと・できないことは正直にそう言う。批判されたら言い訳せず、内容で応える
 - あなたはインターネットや最新情報にアクセスできない。天気・ニュース・株価などリアルタイムの情報は推測で答えず、分からないと伝える"""
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT
@@ -502,7 +505,8 @@ async def on_message(message: discord.Message) -> None:
         log.exception("予期しないエラー")
         answer = "⚠️ 予期しないエラーが発生しました。"
     else:
-        answer = strip_stock_openers(answer)
+        # 捏造されうる参考一覧・リンクや暴走を取り除く (参考情報を使った時だけ引用番号を残す)
+        answer = strip_stock_openers(clean_model_output(answer, keep_markers=bool(knowledge)))
         if knowledge:
             answer = searcher.link_knowledge(answer, knowledge)
         if THINKING_KEEP and THINKING_ENABLED:
