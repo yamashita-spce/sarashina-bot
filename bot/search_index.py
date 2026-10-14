@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -82,6 +83,14 @@ class StoredMessage:
         return datetime.fromtimestamp(self.created_at).strftime("%Y/%m/%d %H:%M")
 
 
+def keyword_pattern(keyword: str) -> re.Pattern:
+    """英数字だけのキーワードは単語単位、それ以外は部分一致の正規表現."""
+    escaped = re.escape(keyword)
+    if re.fullmatch(r"[A-Za-z0-9_.+-]+", keyword):
+        return re.compile(rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])", re.IGNORECASE)
+    return re.compile(escaped, re.IGNORECASE)
+
+
 def normalize(vec: list[float]) -> np.ndarray:
     v = np.asarray(vec[:EMBED_DIM], dtype=np.float32)
     n = np.linalg.norm(v)
@@ -116,14 +125,6 @@ def split_chunks(messages: list[discord.Message]) -> list[list[discord.Message]]
     return chunks
 
 
-def chunk_document(channel_name: str, messages: list[discord.Message]) -> str:
-    """埋め込み用のテキスト."""
-    lines = [f"#{channel_name}"]
-    for m in messages:
-        lines.append(f"{m.author.display_name}: {message_text(m)}")
-    return "\n".join(lines)[:4000]
-
-
 class SearchIndex:
     """SQLite に発言とチャンクを保存し、ベクトルはメモリ上の行列で検索する."""
 
@@ -147,13 +148,12 @@ class SearchIndex:
 
     # --- 書き込み ---
     def add_chunk(
-        self, guild_id: int, channel_id: int, channel_name: str,
-        messages: list[discord.Message], embedding: np.ndarray,
-    ) -> None:
+        self, guild_id: int, channel_id: int, channel_name: str, messages: list[discord.Message],
+    ) -> int:
+        """発言とチャンクを保存する (ベクトル化は後で EmbedWorker が行う). キーワード検索はすぐ使える."""
         cur = self.db.execute(
-            "INSERT INTO chunks (guild_id, channel_id, start_at, end_at, embedding) VALUES (?, ?, ?, ?, ?)",
-            (guild_id, channel_id, messages[0].created_at.timestamp(),
-             messages[-1].created_at.timestamp(), embedding.tobytes()),
+            "INSERT INTO chunks (guild_id, channel_id, start_at, end_at, embedding) VALUES (?, ?, ?, ?, NULL)",
+            (guild_id, channel_id, messages[0].created_at.timestamp(), messages[-1].created_at.timestamp()),
         )
         chunk_id = cur.lastrowid
         self.db.executemany(
@@ -165,9 +165,36 @@ class SearchIndex:
             ],
         )
         self.db.commit()
+        return chunk_id
+
+    def pending_chunks(self, limit: int) -> list[tuple[int, str]]:
+        """まだベクトル化していないチャンクを新しい順に [(chunk_id, 埋め込み用テキスト)]."""
+        rows = self.db.execute(
+            "SELECT id FROM chunks WHERE embedding IS NULL ORDER BY end_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        result = []
+        for (chunk_id,) in rows:
+            msgs = self.chunk_messages(chunk_id)
+            if not msgs:
+                self.db.execute("DELETE FROM chunks WHERE id = ?", (chunk_id,))
+                continue
+            lines = [f"#{msgs[0].channel_name}", *(f"{m.author_name}: {m.content}" for m in msgs)]
+            result.append((chunk_id, "\n".join(lines)[:4000]))
+        self.db.commit()
+        return result
+
+    def pending_count(self) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NULL").fetchone()[0]
+
+    def set_embedding(self, chunk_id: int, embedding: np.ndarray) -> None:
+        row = self.db.execute("SELECT channel_id, start_at FROM chunks WHERE id = ?", (chunk_id,)).fetchone()
+        if not row:
+            return
+        self.db.execute("UPDATE chunks SET embedding = ? WHERE id = ?", (embedding.tobytes(), chunk_id))
+        self.db.commit()
         self.chunk_ids = np.append(self.chunk_ids, chunk_id)
-        self.chunk_channels = np.append(self.chunk_channels, channel_id)
-        self.chunk_times = np.append(self.chunk_times, messages[0].created_at.timestamp())
+        self.chunk_channels = np.append(self.chunk_channels, row[0])
+        self.chunk_times = np.append(self.chunk_times, row[1])
         self.matrix = np.vstack([self.matrix, embedding[None, :]])
 
     def delete_message(self, message_id: int) -> None:
@@ -224,7 +251,10 @@ class SearchIndex:
         self, keywords: list[str], channel_ids: set[int], limit: int,
         author_ids: list[int] | None = None, since: float | None = None, until: float | None = None,
     ) -> list[int]:
-        """キーワードを含む発言のあるチャンク (新しい順)."""
+        """キーワードを含む発言のあるチャンク (新しい順).
+
+        英字のキーワードは単語単位で照合する (「ai」が「mail」「said」に一致しないように)。
+        """
         if not keywords and not author_ids:
             return []
         where, params = self._filters(channel_ids, author_ids, since, until)
@@ -232,11 +262,21 @@ class SearchIndex:
             where.append("(" + " OR ".join("content LIKE ?" for _ in keywords) + ")")
             params += [f"%{k}%" for k in keywords]
         rows = self.db.execute(
-            f"""SELECT chunk_id, MAX(created_at) AS t FROM messages
-                WHERE {' AND '.join(where)} GROUP BY chunk_id ORDER BY t DESC LIMIT ?""",
-            [*params, limit],
+            f"""SELECT chunk_id, content, created_at FROM messages
+                WHERE {' AND '.join(where)} ORDER BY created_at DESC LIMIT ?""",
+            [*params, limit * 20],
         ).fetchall()
-        return [r[0] for r in rows if r[0] is not None]
+        patterns = [keyword_pattern(k) for k in keywords]
+        result: list[int] = []
+        for chunk_id, content, _ in rows:
+            if chunk_id is None or chunk_id in result:
+                continue
+            if patterns and not any(p.search(content) for p in patterns):
+                continue
+            result.append(chunk_id)
+            if len(result) >= limit:
+                break
+        return result
 
     def _filters(self, channel_ids, author_ids, since, until) -> tuple[list[str], list]:
         where = [f"channel_id IN ({','.join('?' * len(channel_ids))})"]
@@ -305,12 +345,18 @@ class SearchIndex:
         return [r[0] for r in rows]
 
     def stats(self) -> tuple[int, int]:
+        """(保存済みの発言数, ベクトル化済みのチャンク数)."""
         msgs = self.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         return msgs, len(self.chunk_ids)
 
 
 class Indexer:
-    """対象チャンネルの過去ログと新着を、埋め込み API の空き枠を使って少しずつ索引付けする."""
+    """発言の取り込み (保存) とベクトル化を行うバックグラウンド処理.
+
+    - 保存: 新着はイベントでリアルタイムに受け取り、会話が一段落したら保存する。
+      過去ログと取りこぼし (Bot 停止中の発言など) は定期巡回で補う。保存は API を使わないので速い
+    - ベクトル化: 未処理のチャンクを新しい順に、埋め込み API の空き枠を使って処理する
+    """
 
     def __init__(
         self,
@@ -320,8 +366,9 @@ class Indexer:
         channel_ids: set[int] | None,
         guild_ids: set[int],
         backfill_limit: int = 5000,
+        backfill_days: float = 365,
         interval: float = 120.0,
-        settle: timedelta = timedelta(minutes=5),
+        idle: timedelta = timedelta(minutes=3),
         headroom: int = 20,
     ) -> None:
         self.client = client
@@ -330,14 +377,28 @@ class Indexer:
         self.channel_ids = channel_ids  # None ならサーバー内の読める全テキストチャンネル
         self.guild_ids = guild_ids
         self.backfill_limit = backfill_limit
+        self.backfill_days = backfill_days  # これより古い発言は遡って取り込まない
         self.interval = interval
-        self.settle = settle  # 会話が落ち着いてから索引付けする (チャンクが途中で切れないように)
+        self.idle = idle  # これだけ発言が途切れたら会話が一段落したとみなして保存する
         self.headroom = headroom  # 検索クエリ用に残しておく埋め込み API の枠
-        self._task: asyncio.Task | None = None
+        self._live: dict[int, list[discord.Message]] = {}  # チャンネルごとの未保存の新着
+        self._tasks: list[asyncio.Task] = []
 
     def start(self) -> None:
-        if not self._task:
-            self._task = asyncio.create_task(self._loop())
+        if not self._tasks:
+            self._tasks = [
+                asyncio.create_task(self._crawl_loop()),
+                asyncio.create_task(self._flush_loop()),
+                asyncio.create_task(self._embed_loop()),
+            ]
+
+    def is_indexed(self, channel) -> bool:
+        guild = getattr(channel, "guild", None)
+        if guild is None or guild.id not in self.guild_ids:
+            return False
+        if self.channel_ids is None:
+            return True
+        return channel.id in self.channel_ids or getattr(channel, "parent_id", None) in self.channel_ids
 
     def channels(self) -> list[discord.abc.Messageable]:
         result = []
@@ -346,70 +407,138 @@ class Indexer:
             if not guild:
                 continue
             for ch in [*guild.text_channels, *guild.threads]:
-                if self.channel_ids is not None and ch.id not in self.channel_ids and getattr(ch, "parent_id", None) not in self.channel_ids:
+                if not self.is_indexed(ch):
                     continue
                 perms = ch.permissions_for(guild.me)
                 if perms.view_channel and perms.read_message_history:
                     result.append(ch)
         return result
 
-    async def _loop(self) -> None:
+    # --- リアルタイム取り込み ---
+    def on_message(self, message: discord.Message) -> None:
+        """新着発言を受け取る (会話が一段落したら _flush_loop が保存する)."""
+        if message.author.bot or not message_text(message) or not self.is_indexed(message.channel):
+            return
+        newest_id, _, _ = self.index.get_state(message.channel.id)
+        if newest_id is None:
+            return  # 初回の取り込み前のチャンネルは巡回に任せる
+        self._live.setdefault(message.channel.id, []).append(message)
+
+    async def _flush_loop(self) -> None:
+        while True:
+            await asyncio.sleep(20)
+            now = datetime.now(timezone.utc)
+            for channel_id, buf in list(self._live.items()):
+                if not buf:
+                    continue
+                idle = now - buf[-1].created_at >= self.idle
+                full = len(buf) >= CHUNK_MAX_MESSAGES or now - buf[0].created_at >= self.idle * 2
+                if idle or full:
+                    self._live[channel_id] = []
+                    try:
+                        self._save(buf[0].channel, buf)
+                    except Exception:
+                        log.exception("新着の保存に失敗しました (channel %s)", channel_id)
+
+    def _save(self, channel, messages: list[discord.Message]) -> int:
+        """発言を会話のまとまりに分けて保存し、チャンネルの取り込み位置を進める."""
+        messages = [m for m in messages if not m.author.bot and message_text(m)]
+        for chunk in split_chunks(messages):
+            self.index.add_chunk(channel.guild.id, channel.id, channel.name, chunk)
+        if messages:
+            newest_id, oldest_id, backfilled = self.index.get_state(channel.id)
+            newest = max(newest_id or 0, messages[-1].id)
+            self.index.set_state(channel.id, newest, oldest_id or messages[0].id, backfilled, len(messages))
+        return len(messages)
+
+    # --- 定期巡回 (初回取り込み・取りこぼし・過去ログ) ---
+    async def _crawl_loop(self) -> None:
         await self.client.wait_until_ready()
         while not self.client.is_closed():
             started = time.monotonic()
-            for ch in self.channels():
-                try:
-                    await self.index_channel(ch)
-                except discord.HTTPException as e:
-                    log.warning("チャンネル %s の索引付けに失敗: %s", ch.id, e)
-                except Exception:
-                    log.exception("チャンネル %s の索引付けで予期しないエラー", ch.id)
-            msgs, chunks = self.index.stats()
-            log.info("索引付けサイクル完了 (%.0f秒): 発言 %d 件 / チャンク %d 件",
-                     time.monotonic() - started, msgs, chunks)
+            channels = sorted(self.channels(), key=lambda c: c.last_message_id or 0, reverse=True)
+            for ch in channels:
+                await self._safe(self.catch_up, ch)
+            for ch in channels:
+                await self._safe(self.backfill, ch)
+            msgs, embedded = self.index.stats()
+            log.info("巡回完了 (%.0f秒): 発言 %d 件 / ベクトル化済み %d チャンク / 未処理 %d チャンク",
+                     time.monotonic() - started, msgs, embedded, self.index.pending_count())
             await asyncio.sleep(self.interval)
 
-    async def index_channel(self, channel) -> None:
-        newest_id, oldest_id, backfilled = self.index.get_state(channel.id)
-        cutoff = discord.Object(discord.utils.time_snowflake(datetime.now(timezone.utc) - self.settle))
+    async def _safe(self, func, ch) -> None:
+        try:
+            await func(ch)
+        except discord.HTTPException as e:
+            log.warning("チャンネル %s の取り込みに失敗: %s", ch.id, e)
+        except Exception:
+            log.exception("チャンネル %s の取り込みで予期しないエラー", ch.id)
 
-        # 1. 新着 (前回の最新以降、落ち着いた発言のみ)
+    def _too_old(self, m: discord.Message) -> bool:
+        return m.created_at < datetime.now(timezone.utc) - timedelta(days=self.backfill_days)
+
+    async def catch_up(self, channel) -> None:
+        """前回の取り込み位置以降の発言 (初回は直近500件) を取り込む.
+
+        リアルタイム取り込み待ちの発言と、まだ会話が続いている直近の発言は除く。
+        """
+        newest_id, oldest_id, backfilled = self.index.get_state(channel.id)
+        cutoff = discord.Object(discord.utils.time_snowflake(datetime.now(timezone.utc) - self.idle))
         if newest_id is None:
-            batch = [m async for m in channel.history(limit=200, before=cutoff)][::-1]
+            batch = [m async for m in channel.history(limit=500, before=cutoff)][::-1]
         else:
             batch = [m async for m in channel.history(
-                limit=500, after=discord.Object(newest_id), before=cutoff, oldest_first=True)]
-        if batch:
-            added = await self._store(channel, batch)
-            newest_id = batch[-1].id
-            oldest_id = oldest_id or batch[0].id
-            self.index.set_state(channel.id, newest_id, oldest_id, backfilled, added)
+                limit=1000, after=discord.Object(newest_id), before=cutoff, oldest_first=True)]
+        pending = {m.id for m in self._live.get(channel.id, [])}
+        batch = [m for m in batch if m.id not in pending]
+        if not batch:
+            if newest_id is None:
+                self.index.set_state(channel.id, None, None, True, 0)
+            return
+        recent = [m for m in batch if not self._too_old(m)]
+        self._save(channel, recent)
+        newest_id, oldest_id, _ = self.index.get_state(channel.id)
+        # 初回取り込みで既に1年より前まで届いていれば、過去ログの遡りは不要
+        done = backfilled or len(recent) < len(batch)
+        self.index.set_state(channel.id, max(newest_id or 0, batch[-1].id),
+                             min(oldest_id or batch[0].id, batch[0].id), done, 0)
 
-        # 2. 過去ログ (少しずつ遡る)
-        if not backfilled and oldest_id is not None:
-            before = discord.Object(oldest_id)
-            batch = [m async for m in channel.history(limit=200, before=before)][::-1]
-            total = self.index.db.execute(
-                "SELECT indexed_messages FROM channel_state WHERE channel_id = ?", (channel.id,)
-            ).fetchone()
-            done = len(batch) < 200 or (total and total[0] + len(batch) >= self.backfill_limit)
-            added = await self._store(channel, batch) if batch else 0
-            if batch:
-                oldest_id = batch[0].id
-            self.index.set_state(channel.id, newest_id, oldest_id, bool(done), added)
-            if done:
-                log.info("チャンネル #%s の過去ログ索引付けが完了しました", channel.name)
-        elif newest_id is None:
-            self.index.set_state(channel.id, None, None, True, 0)
+    async def backfill(self, channel) -> None:
+        """過去ログを500件ずつ遡る (backfill_days より古い発言、または backfill_limit 件で終了)."""
+        newest_id, oldest_id, backfilled = self.index.get_state(channel.id)
+        if backfilled or oldest_id is None:
+            return
+        batch = [m async for m in channel.history(limit=500, before=discord.Object(oldest_id))][::-1]
+        total = self.index.db.execute(
+            "SELECT indexed_messages FROM channel_state WHERE channel_id = ?", (channel.id,)
+        ).fetchone()
+        recent = [m for m in batch if not self._too_old(m)]
+        done = (
+            len(batch) < 500
+            or len(recent) < len(batch)
+            or bool(total and total[0] + len(recent) >= self.backfill_limit)
+        )
+        if recent:
+            self._save(channel, recent)
+        self.index.set_state(channel.id, newest_id, batch[0].id if batch else oldest_id, done, 0)
+        if done:
+            log.info("チャンネル #%s の過去ログ取り込みが完了しました", channel.name)
 
-    async def _store(self, channel, messages: list[discord.Message]) -> int:
-        """Bot 以外の発言をチャンクに分けて埋め込み、保存する."""
-        messages = [m for m in messages if not m.author.bot and message_text(m)]
-        added = 0
-        for chunk in split_chunks(messages):
-            limiter = self.sarashina.limiter(EMBED_MODEL)
-            await limiter.wait_for_headroom(self.headroom)
-            vec = await self.sarashina.embed(chunk_document(channel.name, chunk), "RETRIEVAL_DOCUMENT")
-            self.index.add_chunk(channel.guild.id, channel.id, channel.name, chunk, normalize(vec))
-            added += len(chunk)
-        return added
+    # --- ベクトル化 ---
+    async def _embed_loop(self) -> None:
+        """未処理のチャンクを新しい順にベクトル化する (検索用の枠を残して空き枠だけ使う)."""
+        await self.client.wait_until_ready()
+        limiter = self.sarashina.limiter(EMBED_MODEL)
+        while not self.client.is_closed():
+            pending = self.index.pending_chunks(20)
+            if not pending:
+                await asyncio.sleep(10)
+                continue
+            for chunk_id, text in pending:
+                await limiter.wait_for_headroom(self.headroom)
+                try:
+                    vec = await self.sarashina.embed(text, "RETRIEVAL_DOCUMENT")
+                    self.index.set_embedding(chunk_id, normalize(vec))
+                except Exception:
+                    log.exception("ベクトル化に失敗しました (chunk %s)", chunk_id)
+                    await asyncio.sleep(5)

@@ -56,7 +56,8 @@ DEFAULT_SYSTEM_PROMPT = """あなたは「Sarashina」(SB Intuitions 開発の�
 - 「ご指摘ありがとうございます」「真摯に受け止め」「寄り添う」のような前置き・お礼・謝罪・共感の決まり文句は書かない
 - 普通の「です・ます」調で書く。過剰な敬語や、抽象的・大げさな言い回しは使わない
 - 質問と関係のない過去の話題を持ち出さない
-- 分からないこと・できないことは正直にそう言う。批判されたら言い訳せず、内容で応える"""
+- 分からないこと・できないことは正直にそう言う。批判されたら言い訳せず、内容で応える
+- あなたはインターネットや最新情報にアクセスできない。天気・ニュース・株価などリアルタイムの情報は推測で答えず、分からないと伝える"""
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT
 # 最後のユーザー発言の直後に付ける短い確認 (小さいモデルはプロンプト末尾の指示ほど守るため)
 ANSWER_REMINDER = (
@@ -65,7 +66,7 @@ ANSWER_REMINDER = (
 )
 # モデルが癖で付けがちな決まり文句の書き出し (回答の先頭にあれば取り除く)
 STOCK_OPENERS = re.compile(
-    r"^(はい、?)?(ご質問の意図を(理解|汲み取り)[^。]*。|ご質問(いただき)?ありがとうございます。|お答えいたします。"
+    r"^(はい、?)?(ご質問の意図を(理解|汲み取り)[^。]*。|ご質問(いただき)?ありがとうございます。|お答え(いた)?します。"
     r"|かしこまりました。|承知(いた)?しました。|ご指摘(いただき)?ありがとうございます。|ご意見を受け取りました。)\s*"
 )
 RESTATEMENT = re.compile(r"^[^。\n]{0,80}(ということ|について|をお知りになりたい|を知りたい)ですね。\s*")
@@ -126,9 +127,15 @@ SEARCH_CHANNEL_IDS = {
 } or None
 SEARCH_DB = os.getenv("SEARCH_DB", os.path.join(os.path.dirname(__file__), "..", "data", "search.db"))
 SEARCH_RESULTS = int(os.getenv("SEARCH_RESULTS", "5"))
+# 普通の質問でも、役立つ過去の会話をサーバー全体から探して回答に使う (RAG)
+RAG_ENABLED = os.getenv("RAG_ENABLED", "true").lower() not in ("0", "false", "no")
 
 search_index = SearchIndex(SEARCH_DB) if SEARCH_ENABLED else None
-searcher = Searcher(sarashina, search_index, results=SEARCH_RESULTS) if search_index else None
+searcher = Searcher(
+    sarashina, search_index, results=SEARCH_RESULTS,
+    default_days=float(os.getenv("SEARCH_DEFAULT_DAYS", "365")),
+    max_per_author=int(os.getenv("SEARCH_MAX_PER_AUTHOR", "2")),
+) if search_index else None
 indexer: Indexer | None = None
 
 contexts = ContextManager(
@@ -217,11 +224,13 @@ async def on_ready() -> None:
         indexer = Indexer(
             client, sarashina, search_index, SEARCH_CHANNEL_IDS, guild_ids,
             backfill_limit=int(os.getenv("SEARCH_BACKFILL_LIMIT", "5000")),
+            backfill_days=float(os.getenv("SEARCH_BACKFILL_DAYS", "365")),
             interval=float(os.getenv("SEARCH_INDEX_INTERVAL", "120")),
         )
         indexer.start()
         msgs, chunks = search_index.stats()
-        log.info("検索インデックスを開始しました (発言 %d 件 / チャンク %d 件)", msgs, chunks)
+        log.info("検索インデックスを開始しました (発言 %d 件 / ベクトル化済み %d チャンク / 未処理 %d チャンク)",
+                 msgs, chunks, search_index.pending_count())
 
 
 @client.event
@@ -332,6 +341,8 @@ async def think(
 
 @client.event
 async def on_message(message: discord.Message) -> None:
+    if indexer:
+        indexer.on_message(message)  # 検索インデックスへのリアルタイム取り込み
     if message.author.bot or not is_target(message):
         return
     question = clean_content(message)
@@ -383,6 +394,22 @@ async def on_message(message: discord.Message) -> None:
             log.exception("文脈の取得に失敗しました")
             history = []
 
+        # 1.5 RAG: 質問に役立つ過去の会話をサーバー全体から探す
+        knowledge = []
+        if searcher and RAG_ENABLED:
+            try:
+                view.set_phase("search")
+                allowed = searcher.allowed_channels(message.author, message.guild)
+                if allowed:
+                    knowledge = await searcher.related(
+                        question, allowed,
+                        exclude_after=time.time() - 3600, exclude_channel=message.channel.id,
+                    )
+                    if knowledge:
+                        log.info("RAG: %d 件の過去の会話を参考にします", len(knowledge))
+            except Exception:
+                log.exception("関連する過去の会話の検索に失敗しました")
+
         # 2. 思考 (nano) — mini の回答枠が空くまでの時間も思考に使う
         slot = None
         if THINKING_ENABLED:
@@ -405,6 +432,8 @@ async def on_message(message: discord.Message) -> None:
     system_prompt = SYSTEM_PROMPT
     if context_block:
         system_prompt += "\n\n" + context_block
+    if knowledge:
+        system_prompt += "\n\n" + searcher.knowledge_block(knowledge)
     if view.thinking_text:
         system_prompt += (
             "\n\n## 回答前の思考メモ\n"
@@ -430,6 +459,8 @@ async def on_message(message: discord.Message) -> None:
         answer = "⚠️ 予期しないエラーが発生しました。"
     else:
         answer = strip_stock_openers(answer)
+        if knowledge:
+            answer = searcher.link_knowledge(answer, knowledge)
         if THINKING_KEEP and THINKING_ENABLED:
             answer = f"{view.header}\n{answer}"
     finally:

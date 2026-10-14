@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 import discord
 
 from sarashina import SarashinaClient
-from search_index import SearchIndex, StoredMessage, normalize
+from search_index import SearchIndex, StoredMessage, keyword_pattern, normalize
 
 log = logging.getLogger("sarashina-bot.search")
 
@@ -29,6 +29,7 @@ ROUTER_PROMPT = """あなたは Discord Bot の振り分け担当です。ユー
 - 「〇〇の話どこだっけ？」「〇〇について誰か言ってなかった？」→ type=locate (発言の場所を探す)
 - 「〇〇と議論していた内容をまとめて」「〇〇さんの最近の発言をまとめて」→ type=summarize (過去の会話をまとめる)
 - 直前の検索結果への追加の依頼 (「古すぎる」「もっと最近のを」「他には？」「直近の会話を持ってきて」) も search。
+- Bot への感想・評価・からかい (「お前には検索は早かったか」「使えないな」) や、直前の回答の書き直し依頼 (「文章で出力して」) は chat。
   このときは直前の検索の条件 (話題・人・チャンネル・type) を引き継ぎ、必要に応じて order 等を変える
 それ以外 (一般的な質問・雑談・依頼・Bot の回答への感想や指摘) は mode=chat。
 
@@ -63,6 +64,14 @@ RELEVANCE_PROMPT = """あなたは検索結果の判定係です。ユーザー�
 1. 話題について実際に話している候補だけを選ぶ (単語が一部似ているだけ・無関係な候補は除く)
 2. 選んだ候補ごとに、その話題の中心となっている発言の番号を1つ選ぶ (URL だけ・相づちだけの発言は避ける)
 関連が強い順に並べ、JSON だけを返してください。該当がなければ空配列。
+出力形式: {"results": [{"candidate": 候補番号, "message": 発言番号}, ...]}"""
+
+KNOWLEDGE_PROMPT = """あなたは判定係です。ユーザーの質問と、サーバーの過去の会話の候補が与えられます。
+各候補は [候補番号] の見出しの後に、発言が (発言番号) 付きで並んでいます。
+質問に答えるのに実際に役立つ具体的な情報 (事実・決定事項・経験・意見) が発言の本文に書かれている候補だけを選び、
+(URL だけの発言はリンク先の内容が分からないので根拠にならない)
+その中で最も役立つ発言の番号を1つ選んでください。話題が少し似ているだけの候補は選ばないこと。
+挨拶・雑談・一般常識で答えられる質問なら、空配列を返すこと。
 出力形式: {"results": [{"candidate": 候補番号, "message": 発言番号}, ...]}"""
 
 SUMMARIZE_PROMPT = """あなたは Discord サーバーの過去ログを調べるアシスタントです。
@@ -127,11 +136,14 @@ class Searcher:
     def __init__(
         self, sarashina: SarashinaClient, index: SearchIndex,
         router_model: str = "sarashina3-nano", results: int = 5,
+        default_days: float = 365, max_per_author: int = 2,
     ) -> None:
         self.sarashina = sarashina
         self.index = index
         self.router_model = router_model
         self.results = results
+        self.default_days = default_days  # 期間指定が無いときに探す範囲 (日)
+        self.max_per_author = max_per_author  # 結果に同じ人の発言が並びすぎないように
 
     async def route(
         self, text: str, channel_names: list[str] | None = None, asker: str = "",
@@ -236,10 +248,17 @@ class Searcher:
         return allowed
 
     async def search(self, req: SearchRequest, channel_ids: set[int], guild_id: int, limit: int) -> list[Hit]:
-        """候補を集めて並べ替える. 期間指定で何も見つからなければ期間なしで探し直す."""
+        """候補を集めて並べ替える.
+
+        期間の指定が無ければ直近 default_days 日を探し、見つからなければ全期間で探し直す。
+        期間指定で何も見つからない場合も、期間なしで探し直す。
+        """
+        explicit = req.since is not None or req.until is not None
+        if not explicit and self.default_days:
+            req.since = datetime.now().timestamp() - self.default_days * 86400
         hits = await self._search(req, channel_ids, guild_id, limit)
         if not hits and (req.since or req.until):
-            log.info("期間指定で見つからなかったため、期間なしで再検索します")
+            log.info("期間内で見つからなかったため、全期間で再検索します")
             req.since = req.until = None
             hits = await self._search(req, channel_ids, guild_id, limit)
         return hits
@@ -307,13 +326,31 @@ class Searcher:
             top = await self._filter_relevant(req, ordered[:8])
         else:
             top = list(hits)  # 話題なしの指定は、条件に合う会話をそのまま使う
-        top = self._order(req, top)[:limit]
+        top = self._diversify(req, self._order(req, top), author_ids)[:limit]
 
         # 関連判定でリンク先が決まらなかった会話は、キーワード/rerank で発言を特定する
         await asyncio.gather(*(
             self._pick_best(rerank_query, h, author_ids, req.keywords) for h in top if h.best is None
         ))
         return top
+
+    def _diversify(self, req: SearchRequest, hits: list[Hit], author_ids) -> list[Hit]:
+        """同じ人の発言ばかりにならないよう、1人あたり max_per_author 件までにする.
+
+        人を指定した検索では制限しない。制限で足りなくなる場合は、後ろに回した結果で埋める。
+        """
+        if author_ids or self.max_per_author <= 0:
+            return hits
+        counts: dict[int, int] = {}
+        picked, deferred = [], []
+        for h in hits:
+            m = h.best or max(h.messages, key=lambda x: len(x.content))
+            if counts.get(m.author_id, 0) >= self.max_per_author:
+                deferred.append(h)
+                continue
+            counts[m.author_id] = counts.get(m.author_id, 0) + 1
+            picked.append(h)
+        return picked + deferred
 
     @staticmethod
     def _order(req: SearchRequest, hits: list[Hit]) -> list[Hit]:
@@ -335,7 +372,78 @@ class Searcher:
 
         return [h for _, h in sorted(enumerate(hits), key=score, reverse=True)]
 
-    async def _filter_relevant(self, req: SearchRequest, hits: list[Hit]) -> list[Hit]:
+    async def related(
+        self, question: str, channel_ids: set[int], exclude_after: float | None = None,
+        exclude_channel: int | None = None, limit: int = 3,
+    ) -> list[Hit]:
+        """普通の質問に答えるための RAG: 質問に役立つ過去の会話を探す.
+
+        embedding で候補を集め → rerank で並べ替え → nano で「本当に役立つか」を判定。
+        質問しているチャンネルの直近の会話 (会話履歴として別に渡す分) は除く。
+        """
+        if len(question) < 5 or not len(self.index.chunk_ids):
+            return []
+        qvec = normalize(await self.sarashina.embed(question, "RETRIEVAL_QUERY"))
+        hits = []
+        for cid, _ in self.index.vector_search(qvec, channel_ids, 15):
+            msgs = self.index.chunk_messages(cid)
+            if not msgs:
+                continue
+            if exclude_channel and exclude_after and msgs[0].channel_id == exclude_channel \
+                    and msgs[-1].created_at >= exclude_after:
+                continue
+            hits.append(Hit(cid, 0.0, msgs))
+        if not hits:
+            return []
+        ranked = await self.sarashina.rerank(question, [self._chunk_text(h.messages) for h in hits])
+        ordered = [hits[i] for i, _ in ranked[:6]]
+        picked = await self._filter_relevant(
+            SearchRequest("locate", question), ordered, prompt=KNOWLEDGE_PROMPT, label="ユーザーの質問",
+            keep_phrase=False,
+        )
+        return picked[:limit]
+
+    @staticmethod
+    def knowledge_block(hits: list[Hit]) -> str:
+        """回答モデルに渡す「過去の関連する会話」の参考情報. 各会話に [参N] の番号を付ける."""
+        blocks = []
+        for n, h in enumerate(hits, 1):
+            first = h.messages[0]
+            lines = [f"[参{n}] #{first.channel_name} {first.when}"]
+            lines += [f"{m.author_name}: {m.content[:300]}" for m in h.messages]
+            blocks.append("\n".join(lines)[:1500])
+        return (
+            "## 参考: このサーバーの過去の会話から見つかった関連情報\n"
+            "質問に答えるのに役立つ場合だけ使い、使った箇所には [参1] のように番号を付けること。"
+            "役立たなければ無視し、番号も付けないこと。\n\n" + "\n\n".join(blocks)
+        )
+
+    @staticmethod
+    def link_knowledge(answer: str, hits: list[Hit]) -> str:
+        """回答中の [参N] を発言へのリンクにし、参照した会話を末尾に添える."""
+        used = set()
+
+        def link(match: re.Match) -> str:
+            n = int(match.group(1))
+            if 1 <= n <= len(hits):
+                used.add(n)
+                m = hits[n - 1].best or hits[n - 1].messages[0]
+                return f"[[参{n}]]({m.jump_url})"
+            return ""
+
+        answer = re.sub(r"\[参(\d)\](?!\()", link, answer)
+        if not used:
+            return answer
+        refs = []
+        for n in sorted(used):
+            m = hits[n - 1].best or hits[n - 1].messages[0]
+            refs.append(f"[参{n}] <#{m.channel_id}> {m.when} {m.author_name} [→ 移動]({m.jump_url})")
+        return answer + "\n\n-# 参考にした過去の会話\n" + "\n".join(f"-# {r}" for r in refs)
+
+    async def _filter_relevant(
+        self, req: SearchRequest, hits: list[Hit], prompt: str = RELEVANCE_PROMPT,
+        label: str = "探している話題", keep_phrase: bool = True,
+    ) -> list[Hit]:
         """nano に会話を読ませ、関連する会話と、その中心となる発言 (リンク先) を選ばせる."""
         blocks = []
         for n, h in enumerate(hits):
@@ -345,8 +453,8 @@ class Searcher:
             blocks.append("\n".join(lines)[:1500])
         raw = await self.sarashina.chat(
             [
-                {"role": "system", "content": RELEVANCE_PROMPT},
-                {"role": "user", "content": f"# 探している話題\n{req.query}\n\n# 候補\n" + "\n\n".join(blocks)},
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": f"# {label}\n{req.query}\n\n# 候補\n" + "\n\n".join(blocks)},
             ],
             model=self.router_model,
             max_completion_tokens=300,
@@ -366,11 +474,14 @@ class Searcher:
         except (json.JSONDecodeError, AttributeError, TypeError):
             log.warning("関連判定の結果を読めませんでした: %s", raw[:200])
             return hits
-        # キーワードがそのまま含まれる候補は、判定で落ちても残す (取りこぼし防止)
-        kw = [k for k in req.keywords if len(k) >= 2]
-        for h in hits:
-            if h not in result and kw and any(k.lower() in m.content.lower() for m in h.messages for k in kw):
-                result.append(h)
+        # 探している語句そのものを含む候補は、判定で落ちても残す (取りこぼし防止)
+        # ※ 個々のキーワード (「検索」など) の部分一致では残さない. 無関係な会話が混ざるため
+        phrase = req.query.strip()
+        if keep_phrase and len(phrase) >= 2:
+            pattern = keyword_pattern(phrase)
+            for h in hits:
+                if h not in result and any(pattern.search(m.content) for m in h.messages):
+                    result.append(h)
         return result
 
     @staticmethod

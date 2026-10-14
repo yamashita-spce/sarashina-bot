@@ -9,7 +9,7 @@ Discord の指定チャンネルの投稿に、国産LLM Sarashina (SB Intuition
 - `bot/context.py` — `ContextManager`。チャンネル/スレッドごとに「要約＋最終取り込みメッセージID＋直近の生発言」をメモリ保持し、質問時に新着分だけを nano で差分要約 → `build_context_block` でシステムプロンプトに付加。Bot のステータス行（スピナーで始まる）は除外
 - `bot/thinking.py` — 思考プロンプト（初回/見直し/回答設計）、`ThinkingView`（思考メモの保持と、段階 `PHASES`・スピナー・進捗バーのステータス描画）、`Animator`（バックグラウンドタスクで `STREAM_EDIT_INTERVAL` ごとにステータスを再描画）、`ThrottledEditor`
 - `bot/search.py` — `Searcher`。`route()`(nano で検索判定＋条件抽出, JSON mode) → `search()`(embedding ベクトル検索＋LIKE キーワード検索 → rerank → nano 関連判定で会話と中心発言を選ぶ。期間指定で0件なら期間なしで再検索) → `format_locate()`(リンク付き一覧) / `summarize()`(mini で要約、`[n]` を jump_url リンクに変換)。`allowed_channels()` で質問者が見えるチャンネルに限定
-- `bot/search_index.py` — `SearchIndex`(SQLite: messages/chunks/channel_state、チャンクのベクトルは 256 次元に切り詰め正規化し numpy 行列でメモリ保持) と `Indexer`(バックグラウンドで全テキストチャンネルの新着＋過去ログを200件ずつ索引付け。埋め込み API は `wait_for_headroom(20)` で検索用の枠を残す)
+- `bot/search_index.py` — `SearchIndex`(SQLite: messages/chunks/channel_state。チャンクは保存時は embedding=NULL、後で `set_embedding`。ベクトルは 256 次元に切り詰め正規化し numpy 行列でメモリ保持) と `Indexer`(3つのタスク: `_crawl_loop`=取りこぼし補完 `catch_up`＋過去ログ `backfill`（新しいチャンネル順・1年まで）、`_flush_loop`=`on_message` で受けた新着を会話が3分途切れたら保存、`_embed_loop`=未処理チャンクを新しい順にベクトル化（`wait_for_headroom(20)`）)
 - 設定はすべてルートの `.env`（`.env.example` 参照）
 
 ## on_message の流れ
@@ -29,6 +29,16 @@ Discord の指定チャンネルの投稿に、国産LLM Sarashina (SB Intuition
 - 検索の振り分けに会話の流れを渡さないと、追加の依頼（「古すぎる」「直近のを」）を解釈できず、プロンプト例の人名をそのまま使ってしまった → 直前6件を渡し、例は匿名化
 - Bot への感想が検索扱いになった → `SEARCH_CUES` を含まない投稿は nano を呼ばず chat。order=recent の持ち越しや勝手な until 設定はコード側で補正
 - 新しさの重みを日数の半減期で計算すると、会話がまばらなサーバーでは効かない → 結果内の相対順位で評価（関連度 6 : 新しさ 4）
+
+## RAG（普通の質問）
+- `Searcher.related()`: embedding 候補15 → rerank 上位6 → nano (`KNOWLEDGE_PROMPT`) で役立つものだけ（最大3）→ `knowledge_block` で `[参N]` 付きでシステムプロンプトへ → `link_knowledge` で `[参N]` をリンク化し末尾に出典
+- Sarashina API にマネージドな検索（File Search / Vector Store 相当）は無い。部品の組み合わせで RAG を作る方針（ユーザー要望）
+- 天気など最新情報を RAG の無関係なリンクから捏造した例があった → URL だけの発言は根拠にしない＋「最新情報は推測しない」をシステムプロンプトに追加
+
+## 検索の偏り対策（ユーザー指摘: 古すぎる・特定の人に偏る）
+- 取り込みは保存とベクトル化を分離（保存は API 不要で全チャンネル約2分、ベクトル化は新しい順に約40件/分）
+- 期間指定なしの検索は直近1年 → 0件なら全期間。1人あたり2件まで（`_diversify`）
+- 英字キーワードは単語境界で照合（`keyword_pattern`）。nano が落とした候補はクエリ語句そのものを含む場合だけ復活
 
 ## 検索の設計判断
 - 埋め込みは発言単位ではなく会話チャンク単位（短い発言は意味が取りにくい・埋め込み 60 RPM で全履歴は重い）
