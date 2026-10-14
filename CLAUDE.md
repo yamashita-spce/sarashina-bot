@@ -3,6 +3,8 @@
 ## プロジェクト概要
 Discord の指定チャンネルの投稿に、国産LLM Sarashina (SB Intuitions) の Chat Completions API で回答する Bot。Python + discord.py。
 
+仕組みの全体像（データの流れ・API の役割）は `docs/ARCHITECTURE.md`。**仕組みを変えたらこの文書も更新すること。**
+
 ## 構成
 - `bot/main.py` — discord.py Client。`on_message` で対象チャンネル/スレッドを判定し、文脈・履歴を組み立てて回答。起動時 `cleanup_leftover_thinking` で残骸を片付ける
 - `bot/sarashina.py` — aiohttp ベースの API クライアント `SarashinaClient`（`chat` / `chat_stream`, `model=` で呼び分け）と、予約制の `RateLimiter`（モデルごとに独立。`reserve()` が送信可能時刻を返し、`chat(slot=...)` でその時刻に送る）

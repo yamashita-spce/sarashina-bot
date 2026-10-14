@@ -2,6 +2,8 @@
 
 国産LLM **Sarashina** (SB Intuitions) の API を使い、Discord の指定チャンネルに投稿された質問へ自動で回答する Bot です。
 
+> 返答を生成するまでのデータの流れと、各 API の役割は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) にまとめています。
+
 ## 機能
 
 - 指定チャンネル（とその中のスレッド）への投稿に、Sarashina（`sarashina3-mini`）が返信で回答
@@ -328,6 +330,7 @@ Sarashina API には、ファイルや会話を預けると検索してくれる
 ## 構成
 
 ```
+docs/ARCHITECTURE.md  仕組みの解説（データの流れ・API の役割）
 bot/main.py       Discord Bot 本体（メッセージ受信・履歴構築・思考・回答投稿・残骸の片付け）
 bot/sarashina.py  Sarashina API クライアントとモデル別レートリミッター
 bot/context.py    チャンネル会話の要約（背景コンテキスト）管理
