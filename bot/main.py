@@ -154,6 +154,7 @@ searcher = Searcher(
     max_per_author=int(os.getenv("SEARCH_MAX_PER_AUTHOR", "2")),
     min_rounds=int(os.getenv("SEARCH_MIN_ROUNDS", "2")),
     max_rounds=int(os.getenv("SEARCH_MAX_ROUNDS", "6")),
+    exhaustive_rounds=int(os.getenv("SEARCH_EXHAUSTIVE_ROUNDS", "5")),
 ) if search_index else None
 indexer: Indexer | None = None
 
@@ -592,23 +593,40 @@ async def handle_search(
         req, allowed, message.guild.id, limit, question=question, progress=progress, deadline=slot,
     )
     log.info("検索: %s → %d 件 (%s)", req, len(hits), req.type)
-    if not hits or all(h.approx for h in hits):
-        # 何往復しても十分な情報が無い → 何を補足してほしいか聞き直す
-        slot = await wait_for_mini(view, ["十分な手がかりが無かったので、何が分かれば探せるか考えています"], slot=slot)
-        view.set_phase("summarize", "聞き直す内容を考えています")
-        return await searcher.clarify(req, hits, question, slot=slot)
+    answer = ""
+    if hits and not all(h.approx for h in hits):
+        answer = await compose_answer(view, req, hits, question, slot)
+        slot = None
+    if not answer:
+        # 通常の検索で答えられなかった → 十分かどうかに関わらず5往復、条件も広げ切って粘り強く探す
+        log.info("根拠が足りないため、粘り強く探し直します")
+        view.comment("もう少し粘って、言い方や範囲を変えながら探し直しています")
+        hits = await searcher.search(
+            req, allowed, message.guild.id, limit, question=question, progress=progress, exhaustive=True,
+        )
+        log.info("粘り強い検索: %d 件 (近い話題のみ=%s)", len(hits), all(h.approx for h in hits))
+        if hits and not all(h.approx for h in hits):
+            answer = await compose_answer(view, req, hits, question, slot)
+            slot = None
+    if answer:
+        return answer
+    # 5往復探し切っても根拠が無い → 何を補足してほしいか聞き直す
+    slot = await wait_for_mini(view, ["探し切っても手がかりが少なかったので、何が分かれば探せるか考えています"], slot=slot)
+    view.set_phase("summarize", "聞き直す内容を考えています")
+    return await searcher.clarify(req, hits, question, slot=slot)
+
+
+async def compose_answer(
+    view: ThinkingView, req: SearchRequest, hits: list, question: str, slot: float | None
+) -> str:
+    """見つかった会話から mini が答えを書く. 答えられない (根拠が無い) と判断したら空文字."""
     channels = "・".join(dict.fromkeys(f"#{h.messages[0].channel_name}" for h in hits))
     view.note(f"{channels} などで{len(hits)}件の会話が見つかりました")
     slot = await wait_for_mini(view, [f"見つかった{len(hits)}件の会話を読み比べています",
                                       "話の流れを時系列に並べています"], slot=slot)
     view.set_phase("summarize", f"見つかった{len(hits)}件の会話から答えを書いています")
     answer = await searcher.compose(req, hits, question, slot=slot)
-    if not answer:
-        # 会話を読んだ mini が「依頼に答えられる情報が無い」と判断 → 聞き直す
-        slot = await wait_for_mini(view, ["見つかった会話では答えきれないので、何が分かれば探せるか考えています"])
-        view.set_phase("summarize", "聞き直す内容を考えています")
-        return await searcher.clarify(req, hits, question, slot=slot)
-    return strip_stock_openers(answer)
+    return strip_stock_openers(answer) if answer else ""
 
 
 def setup_logging() -> None:

@@ -97,7 +97,8 @@ ANSWER_PROMPT = """あなたは Discord サーバーの過去ログを調べて�
 - {mode_rule}
 - 根拠にした発言は、その文の末尾に [番号] の形で付ける (例: 〜で決まりました [3][5])。番号は本当に根拠にしたものだけ
 - 会話に書かれていないことは推測で補わない。足りない点があっても「見つかりませんでした」で終わらせず、分かったことを中心に答え、必要なら最後に一言添える
-- ただし、見つかった会話に依頼の話題そのものがほとんど出てこない (関係の薄い会話しか無い) 場合は、無理に答えず「NEED_CLARIFY」とだけ出力する
+- 直接の言及が無くても、関係する話・近い話があればそれを根拠に答える (「直接の言及はありませんが、〜」のように)
+- 見つかった会話が依頼とまったく無関係な場合に限り、「NEED_CLARIFY」とだけ出力する
 - 誰が何を言ったか・何が決まったか・未解決の点が分かるように書く
 - 普通の「です・ます」調。箇条書きは必要なときだけ"""
 
@@ -117,7 +118,7 @@ CLARIFY_PROMPT = """あなたは Discord サーバーの過去ログを調べる
 # (Bot の回答への感想・指摘が誤って検索扱いになるのを防ぐ)
 SEARCH_CUES = re.compile(
     r"どこ|探し|検索|まとめ|要約|言って|話して|話した|話して|議論|発言|言動|ログ|履歴|いつ|誰が|だれが"
-    r"|書いて(た|い)|話題|やりとり|やり取り|会話"
+    r"|書いて(た|い)|話題|やりとり|やり取り|会話|の話|っけ|どうなった|決まった|言ってた|してた"
 )
 # 直前の検索結果への追加の依頼の手がかり
 FOLLOWUP_CUES = re.compile(r"古|最近|直近|最新|新し|他に|ほかに|もっと|続き|別の|それ以外|全部|詳しく")
@@ -194,7 +195,7 @@ class Searcher:
         self, sarashina: SarashinaClient, index: SearchIndex,
         router_model: str = "sarashina3-nano", results: int = 5,
         default_days: float = 365, max_per_author: int = 2,
-        min_rounds: int = 2, max_rounds: int = 4,
+        min_rounds: int = 2, max_rounds: int = 4, exhaustive_rounds: int = 5,
     ) -> None:
         self.sarashina = sarashina
         self.index = index
@@ -204,6 +205,7 @@ class Searcher:
         self.max_per_author = max_per_author  # 結果に同じ人の発言が並びすぎないように
         self.min_rounds = min_rounds  # 検索を最低何往復するか
         self.max_rounds = max_rounds  # 検索を最大何往復するか
+        self.exhaustive_rounds = exhaustive_rounds  # 粘り強く探すモードで必ず回る往復数
 
     async def route(
         self, text: str, channel_names: list[str] | None = None, asker: str = "",
@@ -309,9 +311,12 @@ class Searcher:
 
     async def search(
         self, req: SearchRequest, channel_ids: set[int], guild_id: int, limit: int,
-        question: str = "", progress=None, deadline: float | None = None,
+        question: str = "", progress=None, deadline: float | None = None, exhaustive: bool = False,
     ) -> list[Hit]:
         """候補を集めて並べ替える.
+
+        exhaustive=True は「粘り強く探す」モード: 十分かどうかに関わらず exhaustive_rounds 回往復し、
+        条件も広げ切る (通常の検索で答えられなかったときの最終手段)。
 
         期間の指定が無ければ直近 default_days 日を探し、見つからなければ全期間で探し直す。
         期間指定で何も見つからない場合も、期間なしで探し直す。
@@ -319,18 +324,18 @@ class Searcher:
         explicit = req.since is not None or req.until is not None
         if not explicit and self.default_days:
             req.since = datetime.now().timestamp() - self.default_days * 86400
-        hits = await self._search(req, channel_ids, guild_id, limit, question, progress, deadline)
+        hits = await self._search(req, channel_ids, guild_id, limit, question, progress, deadline, exhaustive)
         if not hits and (req.since or req.until):
             log.info("期間内で見つからなかったため、全期間で再検索します")
             if progress:
                 await progress("もっと前の会話まで広げて探しています")
             req.since = req.until = None
-            hits = await self._search(req, channel_ids, guild_id, limit, question, progress, deadline)
+            hits = await self._search(req, channel_ids, guild_id, limit, question, progress, deadline, exhaustive)
         return hits
 
     async def _search(
         self, req: SearchRequest, channel_ids: set[int], guild_id: int, limit: int,
-        question: str = "", progress=None, deadline: float | None = None,
+        question: str = "", progress=None, deadline: float | None = None, exhaustive: bool = False,
     ) -> list[Hit]:
         """何往復かして候補を集め、rerank → 関連判定で絞り込む.
 
@@ -355,7 +360,7 @@ class Searcher:
         else:
             top = await self._deep_search(
                 req, topic, rerank_query, channel_ids, all_channels, author_ids, limit, question,
-                report, deadline,
+                report, deadline, exhaustive,
             )
             if top is None:
                 return []
@@ -376,14 +381,19 @@ class Searcher:
     async def _deep_search(
         self, req: SearchRequest, topic: str, rerank_query: str, channel_ids: set[int],
         all_channels: set[int], author_ids, limit: int, question: str, report, deadline: float | None,
+        exhaustive: bool = False,
     ) -> list[Hit] | None:
         """十分な情報が集まるまで何往復も検索する.
 
         - 2回目以降は nano が「足りない情報」と次の検索語 (言い換え・関連語・手がかり) を考える
         - 言い換えで新しい会話が見つからなくなったら、条件を広げる (期間 → チャンネル → 人)
         - deadline (mini の回答枠が空く時刻) までは、十分でも検索を続けて情報を厚くする
-        - 最後まで一致する会話が無くても、近い話題の会話を「近い話題」として返す (諦めない)
+        - 「十分」は、nano の判定に加えて、元の話題の語が実際に本文に出てくる (根拠がある) ときだけ
+        - 通常: 根拠のある関連会話が無ければ approx を立てて返す (呼び出し側が粘り強いモードで探し直す)
+        - exhaustive: 十分でも止めず exhaustive_rounds 回往復し、関連会話があれば根拠語が無くても返す
         """
+        min_rounds = self.exhaustive_rounds if exhaustive else self.min_rounds
+        max_rounds = self.exhaustive_rounds if exhaustive else self.max_rounds
         pool: dict[int, Hit] = {}
         tried: list[str] = []
         queries = [(topic, list(req.keywords))]
@@ -396,7 +406,12 @@ class Searcher:
             ("person", bool(author_ids)),
         ) if cond]
         rnd, stale = 0, 0
-        while rnd < self.max_rounds:
+        patterns = [keyword_pattern(k) for k in evidence_keywords]
+
+        def has_evidence(hits: list[Hit]) -> bool:
+            return any(p.search(m.content) for h in hits for m in h.messages for p in patterns)
+
+        while rnd < max_rounds:
             rnd += 1
             before_ids = set(pool)
             for q, kws in queries:
@@ -414,24 +429,25 @@ class Searcher:
             stale = 0 if found else stale + 1
             if found:
                 await report(f"関連しそうな会話を{len(pool)}件見つけて、中身を確かめています")
-            if rnd >= self.max_rounds:
+            if rnd >= max_rounds:
                 break
             time_left = deadline is not None and deadline - time.monotonic() > 4
             decision = await self._next_queries(
-                question or topic, tried, ranked[:8], must_continue=rnd < self.min_rounds or time_left)
+                question or topic, tried, ranked[:8], must_continue=rnd < min_rounds or time_left)
             nexts = [
                 (n["query"].strip(), [k for k in n.get("keywords") or [] if isinstance(k, str)])
                 for n in decision.get("next") or []
                 if isinstance(n, dict) and isinstance(n.get("query"), str) and n["query"].strip()
                 and n["query"].strip() not in tried
             ][:2]
-            sufficient = bool(decision.get("sufficient")) and bool(pool)
+            sufficient = bool(decision.get("sufficient")) and bool(pool) and has_evidence(ranked[:10])
             log.info("検索 %d 回目: %d 件 (新規 %d) / 十分=%s / 次: %s", rnd, len(pool), found,
                      sufficient, [q for q, _ in nexts])
-            if sufficient and rnd >= self.min_rounds and not time_left:
+            if sufficient and rnd >= min_rounds and not time_left:
                 break
             # 言い換えでも新しい会話が見つからない → 条件を広げて探し直す
-            if (stale >= 2 or not nexts or not pool) and broaden:
+            if (stale >= 2 or not nexts or not pool or (exhaustive and not has_evidence(ranked[:10]))) \
+                    and broaden:
                 step = broaden.pop(0)
                 if step == "period":
                     req.since = req.until = None
@@ -457,13 +473,12 @@ class Searcher:
             return None
         await report("見つかった会話を読み比べて、関係あるものを選んでいます")
         top = await self._filter_relevant(req, ranked[:10])
-        # 根拠の確認: どの検索語も本文に出てこない (意味が近いだけの会話しか無い) なら、見つかっていない扱い
-        patterns = [keyword_pattern(k) for k in evidence_keywords]
-        if top and not any(p.search(m.content) for h in top for m in h.messages for p in patterns):
-            log.info("検索語を含む会話が無いため、十分な情報が見つからなかった扱いにします")
+        # 通常モードでは、話題の語がどの本文にも出てこない (意味が近いだけ) なら根拠不足として扱い、
+        # 呼び出し側に粘り強いモードでの探し直しを促す。粘り強いモードでは関連会話があればそれで答える
+        if top and not exhaustive and not has_evidence(top):
+            log.info("話題の語を含む会話が無いため、根拠不足として扱います")
             top = []
         if not top:
-            # 完全に一致する会話が無くても、関連が高い会話を「近い話題」として出す
             top = ranked[:3]
             for h in top:
                 h.approx = True
@@ -483,8 +498,10 @@ class Searcher:
             if named:
                 channel_ids = named
             else:
-                req.query = f"{req.channel} {req.query}".strip()
-                req.keywords.append(req.channel)
+                if req.channel not in req.query:
+                    req.query = f"{req.channel} {req.query}".strip()
+                if req.channel not in req.keywords:
+                    req.keywords.append(req.channel)
         return author_ids, channel_ids
 
     def _to_hits(self, chunk_ids: list[int], author_ids) -> list[Hit]:
@@ -729,7 +746,8 @@ class Searcher:
         # 十分な情報が無い → 呼び出し側で聞き直す (合図を出さずに「見当たらない」と書いてくる場合も含む)
         # (1文目は「依頼への答え」と決めているので、1文目が「見当たらない」なら見つかっていない)
         first_sentence = re.split(r"(?<=[。！？\n])", answer.strip(), maxsplit=1)[0]
-        if "NEED_CLARIFY" in answer or NOT_FOUND.search(first_sentence):
+        cited = re.search(r"\[\d{1,3}\]", answer)
+        if "NEED_CLARIFY" in answer or (not cited and NOT_FOUND.search(first_sentence)):
             return ""
         return cite(answer, numbered, "参考にした発言")
 
