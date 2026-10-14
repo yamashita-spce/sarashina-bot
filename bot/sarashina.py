@@ -190,6 +190,24 @@ class SarashinaClient:
         content = body["choices"][0]["message"].get("content") or ""
         return content.strip()
 
+    async def chat_many(
+        self,
+        messages: list[dict],
+        n: int,
+        model: str | None = None,
+        max_completion_tokens: int | None = None,
+        temperature: float | None = None,
+        retries: int = 2,
+        slot: float | None = None,
+    ) -> list[str]:
+        """1リクエストで n 通り (最大5) の回答を生成する. レート制限の消費は1回分."""
+        payload = self._payload(messages, model or self.model, max_completion_tokens, temperature)
+        payload["n"] = max(1, min(5, n))
+        resp = await self._post(payload, retries, slot)
+        async with resp:
+            body = await resp.json()
+        return [(c["message"].get("content") or "").strip() for c in body["choices"]]
+
     async def chat_stream(
         self,
         messages: list[dict],

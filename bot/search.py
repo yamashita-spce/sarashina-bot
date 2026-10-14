@@ -106,6 +106,24 @@ NOT_FOUND = re.compile(r"見当たりません|見つかりません|確認で�
 LOCATE_RULE = "依頼は「その話をどこでしていたか」を知りたいもの。どのチャンネルで・いつ頃・誰が・どんな流れで話していたかを文章で答える"
 SUMMARIZE_RULE = "依頼は過去の会話の内容を知りたいもの。話題ごとに要点を整理して答える"
 
+JUDGE_PROMPT = """あなたは回答の審査員です。ユーザーの依頼、根拠となる過去の会話 (各発言に [番号])、
+AI が書いた回答案 (A, B, C ...) が与えられます。手順に沿って審査し、JSON だけを返してください。
+
+手順:
+1. 依頼が本当に求めていること (知りたいこと) を一文で書く
+2. 各回答案を次の観点で評価する
+   - 依頼に正面から答えているか (1文目で答えているか)
+   - 書かれた内容が、引用した [番号] の発言に実際に書かれているか (根拠のない記述・番号の付け間違いが無いか)
+   - 根拠となる会話にある大事な情報を落としていないか
+3. 最も良い回答案を選ぶ
+4. どの回答案も、依頼に答えるのに大事な観点が欠けている (会話には無いが、探せば見つかりそうな) 場合は、
+   その観点と、それを探すための短い検索語を書く。十分なら空文字
+
+出力形式:
+{"need": "依頼が求めていること", "best": "A などの記号", "reasons": "選んだ理由 (短く)",
+ "problems": "選んだ案に残る問題 (無ければ空文字)", "missing": "欠けている観点 (無ければ空文字)",
+ "search": "欠けている観点を探す検索語 (無ければ空文字)"}"""
+
 CLARIFY_PROMPT = """あなたは Discord サーバーの過去ログを調べるアシスタントです。
 ユーザーの依頼について何往復も検索しましたが、答えるのに十分な会話が見つかりませんでした。
 ユーザーに聞き直すための、短く自然な質問を1〜3文で書いてください。
@@ -156,6 +174,13 @@ def cite(answer: str, messages: list[StoredMessage], title: str, prefix: str = "
         snippet = snippet[:40] + "…" if len(snippet) > 40 else snippet
         refs.append(f"-# [{prefix}{k}] <#{m.channel_id}> {m.when} {m.author_name}「{snippet}」[→ 移動]({m.jump_url})")
     return answer + f"\n\n-# {title}\n" + "\n".join(refs)
+
+
+@dataclass
+class ComposeResult:
+    answer: str  # 回答 (根拠が無ければ空文字)
+    missing: str = ""  # 審査で欠けていると判定された観点
+    search: str = ""  # その観点を探すための検索語
 
 
 @dataclass
@@ -720,9 +745,19 @@ class Searcher:
 
     # --- 出力 ---
     async def compose(
-        self, req: SearchRequest, hits: list[Hit], user_text: str, slot: float | None = None
-    ) -> str:
-        """見つかった会話を根拠に、依頼への答えを mini が文章で書く. 末尾に参考にした発言を添える."""
+        self, req: SearchRequest, hits: list[Hit], user_text: str, slot: float | None = None,
+        progress=None, candidates: int = 3,
+    ) -> ComposeResult:
+        """見つかった会話を根拠に、依頼への答えを書く.
+
+        1. mini に回答案を candidates 通り書かせる (n パラメータで1リクエスト = レート制限1回分)
+        2. nano が根拠の会話と回答案を読み比べ、依頼に正面から答えているか・根拠があるか・大事な情報を
+           落としていないかを審査して一番良い案を選ぶ。欠けている観点があれば、それを探す検索語も返す
+        """
+        async def report(label: str) -> None:
+            if progress:
+                await progress(label)
+
         hits = sorted(hits, key=lambda h: h.messages[0].created_at)
         numbered: list[StoredMessage] = []
         blocks = []
@@ -735,21 +770,53 @@ class Searcher:
             blocks.append("\n".join(lines))
         context = "\n\n".join(blocks)[:12000]
         rule = LOCATE_RULE if req.type == "locate" else SUMMARIZE_RULE
-        answer = await self.sarashina.chat(
+        drafts = await self.sarashina.chat_many(
             [
                 {"role": "system", "content": ANSWER_PROMPT.format(mode_rule=rule)},
                 {"role": "user", "content": f"# 依頼\n{user_text}\n\n# 見つかった会話\n{context}"},
             ],
-            temperature=0.3,
+            n=candidates,
+            temperature=0.7 if candidates > 1 else 0.3,
             slot=slot,
         )
-        # 十分な情報が無い → 呼び出し側で聞き直す (合図を出さずに「見当たらない」と書いてくる場合も含む)
-        # (1文目は「依頼への答え」と決めているので、1文目が「見当たらない」なら見つかっていない)
-        first_sentence = re.split(r"(?<=[。！？\n])", answer.strip(), maxsplit=1)[0]
-        cited = re.search(r"\[\d{1,3}\]", answer)
-        if "NEED_CLARIFY" in answer or (not cited and NOT_FOUND.search(first_sentence)):
-            return ""
-        return cite(answer, numbered, "参考にした発言")
+        # 根拠が無いと書いてきた案は除く (1文目は「依頼への答え」と決めているので、1文目で判定)
+        usable = []
+        for d in drafts:
+            first_sentence = re.split(r"(?<=[。！？\n])", d.strip(), maxsplit=1)[0]
+            cited = re.search(r"\[\d{1,3}\]", d)
+            if d and "NEED_CLARIFY" not in d and not (not cited and NOT_FOUND.search(first_sentence)):
+                usable.append(d)
+        if not usable:
+            return ComposeResult("")
+        if len(usable) == 1:
+            return ComposeResult(cite(usable[0], numbered, "参考にした発言"))
+
+        await report(f"{len(usable)}通りの回答案を書いて、どれが質問に一番合うか比べています")
+        # ※ rerank で回答案と質問の関連度も測ったが、どの案も 1.0 付近に張り付き差が出なかったため使わない
+        labels = "ABCDE"
+        listing = "\n\n".join(f"## 回答案 {labels[i]}\n{d}" for i, d in enumerate(usable))
+        judged: dict = {}
+        try:
+            raw = await self.sarashina.chat(
+                [
+                    {"role": "system", "content": JUDGE_PROMPT},
+                    {"role": "user", "content": f"# 依頼\n{user_text}\n\n# 根拠となる会話\n{context[:8000]}\n\n# 回答案\n{listing}"},
+                ],
+                model=self.router_model, max_completion_tokens=800, temperature=0.0,
+                response_format={"type": "json_object"},
+            )
+            judged = json.loads(raw)
+        except Exception:
+            log.warning("回答案の審査に失敗しました", exc_info=True)
+        best = str(judged.get("best") or "").strip()[:1].upper()
+        idx = labels.index(best) if best and best in labels[:len(usable)] else 0
+        log.info("回答案 %d 通りから %s を選択 / 理由: %s / 欠け: %s",
+                 len(usable), labels[idx], judged.get("reasons"), judged.get("missing"))
+        return ComposeResult(
+            cite(usable[idx], numbered, "参考にした発言"),
+            missing=str(judged.get("missing") or "").strip(),
+            search=str(judged.get("search") or "").strip(),
+        )
 
     async def clarify(
         self, req: SearchRequest, hits: list[Hit], user_text: str, slot: float | None = None

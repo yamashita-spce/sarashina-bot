@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 from context import ContextManager
 from sarashina import SarashinaClient, SarashinaError
-from search import SearchRequest, Searcher
+from search import ComposeResult, SearchRequest, Searcher
 from search_index import Indexer, SearchIndex
 from thinking import (
     PLAN_LABELS_PROMPT,
@@ -144,6 +144,10 @@ SEARCH_CHANNEL_IDS = {
 } or None
 SEARCH_DB = os.getenv("SEARCH_DB", os.path.join(os.path.dirname(__file__), "..", "data", "search.db"))
 SEARCH_RESULTS = int(os.getenv("SEARCH_RESULTS", "5"))
+# 検索の回答案を何通り書いて比べるか (mini の n パラメータ. 1リクエスト = レート制限1回分)
+ANSWER_CANDIDATES = int(os.getenv("ANSWER_CANDIDATES", "3"))
+# 審査で欠けている観点が見つかったら、追加で探して書き直すか (mini をもう1回使う)
+ANSWER_REFINE_ENABLED = os.getenv("ANSWER_REFINE_ENABLED", "true").lower() not in ("0", "false", "no")
 # 普通の質問でも、役立つ過去の会話をサーバー全体から探して回答に使う (RAG)
 RAG_ENABLED = os.getenv("RAG_ENABLED", "true").lower() not in ("0", "false", "no")
 
@@ -593,11 +597,11 @@ async def handle_search(
         req, allowed, message.guild.id, limit, question=question, progress=progress, deadline=slot,
     )
     log.info("検索: %s → %d 件 (%s)", req, len(hits), req.type)
-    answer = ""
+    result = ComposeResult("")
     if hits and not all(h.approx for h in hits):
-        answer = await compose_answer(view, req, hits, question, slot)
+        result = await compose_answer(view, req, hits, question, slot, progress)
         slot = None
-    if not answer:
+    if not result.answer:
         # 通常の検索で答えられなかった → 十分かどうかに関わらず5往復、条件も広げ切って粘り強く探す
         log.info("根拠が足りないため、粘り強く探し直します")
         view.comment("もう少し粘って、言い方や範囲を変えながら探し直しています")
@@ -606,10 +610,25 @@ async def handle_search(
         )
         log.info("粘り強い検索: %d 件 (近い話題のみ=%s)", len(hits), all(h.approx for h in hits))
         if hits and not all(h.approx for h in hits):
-            answer = await compose_answer(view, req, hits, question, slot)
+            result = await compose_answer(view, req, hits, question, slot, progress)
             slot = None
-    if answer:
-        return answer
+    if result.answer and result.search and ANSWER_REFINE_ENABLED:
+        # 審査で「大事な観点が欠けている」と判定 → その観点で追加検索し、集め直して書き直す (1回まで)
+        log.info("欠けている観点「%s」を追加で探します (検索語: %s)", result.missing, result.search)
+        view.comment(f"「{result.missing[:20]}」が足りないので、追加で探しています" if result.missing
+                     else "足りない観点を追加で探しています")
+        extra_req = SearchRequest(req.type, result.search, result.search.split()[:6], person=req.person,
+                                  channel=req.channel)
+        extra = await searcher.search(extra_req, allowed, message.guild.id, 3, question=question, progress=progress)
+        known = {h.chunk_id for h in hits}
+        added = [h for h in extra if not h.approx and h.chunk_id not in known]
+        if added:
+            view.note(f"足りなかった観点について{len(added)}件の会話を追加しました")
+            refined = await compose_answer(view, req, hits + added, question, None, progress, refine=True)
+            if refined.answer:
+                result = refined
+    if result.answer:
+        return result.answer
     # 5往復探し切っても根拠が無い → 何を補足してほしいか聞き直す
     slot = await wait_for_mini(view, ["探し切っても手がかりが少なかったので、何が分かれば探せるか考えています"], slot=slot)
     view.set_phase("summarize", "聞き直す内容を考えています")
@@ -617,16 +636,21 @@ async def handle_search(
 
 
 async def compose_answer(
-    view: ThinkingView, req: SearchRequest, hits: list, question: str, slot: float | None
-) -> str:
-    """見つかった会話から mini が答えを書く. 答えられない (根拠が無い) と判断したら空文字."""
-    channels = "・".join(dict.fromkeys(f"#{h.messages[0].channel_name}" for h in hits))
-    view.note(f"{channels} などで{len(hits)}件の会話が見つかりました")
+    view: ThinkingView, req: SearchRequest, hits: list, question: str, slot: float | None,
+    progress=None, refine: bool = False,
+) -> ComposeResult:
+    """見つかった会話から mini が回答案を複数書き、審査で一番良いものを選ぶ (根拠が無ければ空)."""
+    if not refine:
+        channels = "・".join(dict.fromkeys(f"#{h.messages[0].channel_name}" for h in hits))
+        view.note(f"{channels} などで{len(hits)}件の会話が見つかりました")
     slot = await wait_for_mini(view, [f"見つかった{len(hits)}件の会話を読み比べています",
                                       "話の流れを時系列に並べています"], slot=slot)
-    view.set_phase("summarize", f"見つかった{len(hits)}件の会話から答えを書いています")
-    answer = await searcher.compose(req, hits, question, slot=slot)
-    return strip_stock_openers(answer) if answer else ""
+    view.comment("集めた会話を踏まえて、回答を書き直しています" if refine
+                 else f"見つかった{len(hits)}件の会話から回答案を書いています")
+    result = await searcher.compose(req, hits, question, slot=slot, progress=progress,
+                                    candidates=ANSWER_CANDIDATES)
+    result.answer = strip_stock_openers(result.answer) if result.answer else ""
+    return result
 
 
 def setup_logging() -> None:
